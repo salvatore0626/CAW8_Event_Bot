@@ -1,0 +1,189 @@
+{
+  "active_version": "v1",
+  "versions": {
+    "v1": {
+      "title": "ASVAB",
+      "randomize_questions": true,
+      "randomize_answers": true,
+      "categories": [
+        "Electronics",
+        "Radar",
+        "Jamming",
+        "Communications",
+        "Tactics"
+      ],
+      "questions": [
+        {
+          "id": "asvab_elec_001",
+          "category": "Electronics",
+          "question": "Which component stores electrical charge?",
+          "choices": [
+            "Resistor",
+            "Capacitor",
+            "Diode",
+            "Fuse"
+          ],
+          "multi_select": false,
+          "answer": [
+            "B"
+          ],
+          "explanation": ""
+        },
+        {
+          "id": "asvab_elec_002",
+          "category": "Electronics",
+          "question": "Select all components that can affect current flow.",
+          "choices": [
+            "Resistor",
+            "Switch",
+            "Open circuit",
+            "Paint color"
+          ],
+          "multi_select": true,
+          "answer": [
+            "A",
+            "B",
+            "C"
+          ],
+          "explanation": ""
+        },
+        {
+          "id": "asvab_radar_001",
+          "category": "Radar",
+          "question": "Radar primarily detects targets by using what?",
+          "choices": [
+            "Reflected radio energy",
+            "Infrared only",
+            "Magnetic north",
+            "Visual contrast only"
+          ],
+          "multi_select": false,
+          "answer": [
+            "A"
+          ],
+          "explanation": ""
+        },
+        {
+          "id": "asvab_radar_002",
+          "category": "Radar",
+          "question": "Select all factors that can affect radar detection.",
+          "choices": [
+            "Target aspect",
+            "Range",
+            "Terrain masking",
+            "Pilot callsign"
+          ],
+          "multi_select": true,
+          "answer": [
+            "A",
+            "B",
+            "C"
+          ],
+          "explanation": ""
+        },
+        {
+          "id": "asvab_jam_001",
+          "category": "Jamming",
+          "question": "Noise jamming generally attempts to do what?",
+          "choices": [
+            "Increase radar clarity",
+            "Deny or degrade radar returns",
+            "Repair radar hardware",
+            "Improve fuel flow"
+          ],
+          "multi_select": false,
+          "answer": [
+            "B"
+          ],
+          "explanation": ""
+        },
+        {
+          "id": "asvab_jam_002",
+          "category": "Jamming",
+          "question": "Select all statements that describe good jamming support.",
+          "choices": [
+            "Positioning matters",
+            "Timing matters",
+            "Friendly aircraft can benefit from geometry",
+            "It always works at any range"
+          ],
+          "multi_select": true,
+          "answer": [
+            "A",
+            "B",
+            "C"
+          ],
+          "explanation": ""
+        },
+        {
+          "id": "asvab_comms_001",
+          "category": "Communications",
+          "question": "What is brevity intended to improve?",
+          "choices": [
+            "Radio clarity and speed",
+            "Aircraft paint quality",
+            "Fuel economy",
+            "Runway length"
+          ],
+          "multi_select": false,
+          "answer": [
+            "A"
+          ],
+          "explanation": ""
+        },
+        {
+          "id": "asvab_comms_002",
+          "category": "Communications",
+          "question": "Select all good radio practices.",
+          "choices": [
+            "Use clear callsigns",
+            "Keep transmissions concise",
+            "Step on other transmissions",
+            "Confirm important instructions"
+          ],
+          "multi_select": true,
+          "answer": [
+            "A",
+            "B",
+            "D"
+          ],
+          "explanation": ""
+        },
+        {
+          "id": "asvab_tac_001",
+          "category": "Tactics",
+          "question": "What is a common reason to use terrain masking?",
+          "choices": [
+            "Reduce exposure to threats",
+            "Increase enemy radar clarity",
+            "Make radios louder",
+            "Increase drag on purpose"
+          ],
+          "multi_select": false,
+          "answer": [
+            "A"
+          ],
+          "explanation": ""
+        },
+        {
+          "id": "asvab_tac_002",
+          "category": "Tactics",
+          "question": "Select all items that can improve survivability.",
+          "choices": [
+            "Situational awareness",
+            "Mutual support",
+            "Threat knowledge",
+            "Ignoring mission planning"
+          ],
+          "multi_select": true,
+          "answer": [
+            "A",
+            "B",
+            "C"
+          ],
+          "explanation": ""
+        }
+      ]
+    }
+  }
+}
