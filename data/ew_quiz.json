@@ -1,0 +1,493 @@
+{
+  "active_version": "version 1",
+  "versions": {
+    "version 1": {
+      "title": "Electronic Warfare Qualification Test",
+      "passing_score": 80,
+      "randomize_questions": true,
+      "randomize_answers": false,
+      "questions": [
+        {
+          "id": "ew_001",
+          "category": "EW Fundamentals",
+          "question": "What does DRFM stand for?",
+          "choices": [
+            "Digital Radio Frequency Modulation",
+            "Digital Radio Frequency Memory",
+            "Don't Remember Forget Math",
+            "Digital Radar Frequency Manipulation"
+          ],
+          "answer": [
+            "B"
+          ],
+          "explanation": "",
+          "multi_select": false
+        },
+        {
+          "id": "ew_002",
+          "category": "EW Fundamentals",
+          "question": "What does SAS stand for?",
+          "choices": [
+            "Stability Assistance System",
+            "System Augmented Signature",
+            "Signature Augmentation Subsystem",
+            "System Augmented Signal"
+          ],
+          "answer": [
+            "C"
+          ],
+          "explanation": "",
+          "multi_select": false
+        },
+        {
+          "id": "ew_003",
+          "category": "EW Fundamentals",
+          "question": "What does RGPO stand for?",
+          "choices": [
+            "Range Gate Pull Off",
+            "Radar Gain Pulse Obstruction",
+            "Radar Guided Penile Object",
+            "Range Gauged Position Observation"
+          ],
+          "answer": [
+            "A"
+          ],
+          "explanation": "",
+          "multi_select": false
+        },
+        {
+          "id": "ew_004",
+          "category": "DRFM",
+          "question": "Can DRFM be used to support friendly aircraft?",
+          "choices": [
+            "YES",
+            "NO"
+          ],
+          "answer": [
+            "B"
+          ],
+          "explanation": "",
+          "multi_select": false
+        },
+        {
+          "id": "ew_005",
+          "category": "Noise Jamming",
+          "question": "What is low-band noise jamming used for?",
+          "choices": [
+            "Jamming GPS",
+            "Jamming long range search radars",
+            "Jamming communications"
+          ],
+          "answer": [
+            "C"
+          ],
+          "explanation": "",
+          "multi_select": true
+        },
+        {
+          "id": "ew_006",
+          "category": "Noise Jamming",
+          "question": "What is mid-band noise jamming used for?",
+          "choices": [
+            "Jamming radars currently in STT",
+            "Jamming Missiles",
+            "Jamming helicopter ground radars",
+            "Jamming radars outside of STT",
+            "Both A & C"
+          ],
+          "answer": [
+            "D"
+          ],
+          "explanation": "",
+          "multi_select": false
+        },
+        {
+          "id": "ew_007",
+          "category": "Noise Jamming",
+          "question": "What is high-band noise jamming used for? Select all that apply.",
+          "choices": [
+            "Jamming ground mapping radars",
+            "Jamming missile warning radars",
+            "Jamming cruise missiles"
+          ],
+          "answer": [
+            "A",
+            "B",
+            "C"
+          ],
+          "explanation": "",
+          "multi_select": true
+        },
+        {
+          "id": "ew_008",
+          "category": "Noise Jamming",
+          "question": "What is burn-through range?",
+          "choices": [
+            "The range at which a radar can discern a target through noise",
+            "The range at which jamming burns a missile's seeker",
+            "The range at which jamming may cause spontaneous combustion",
+            "The range at which a jamming pod will jam another aircraft"
+          ],
+          "answer": [
+            "A"
+          ],
+          "explanation": "",
+          "multi_select": false
+        },
+        {
+          "id": "ew_009",
+          "category": "HOJ",
+          "question": "What does HOJ stand for?",
+          "choices": [
+            "High Output Jamming",
+            "Home On Jamming",
+            "High Offset Jamming",
+            "High On Jetfuel"
+          ],
+          "answer": [
+            "B"
+          ],
+          "explanation": "",
+          "multi_select": false
+        },
+        {
+          "id": "ew_010",
+          "category": "Jamming Support",
+          "question": "What is the jamming corridor?",
+          "choices": [
+            "The area around a radar where it can be jammed",
+            "The area where jamming is ineffective",
+            "The area between a jamming source and a target where friendly aircraft can benefit from jamming",
+            "The area where friendly aircraft are jamming radar targets"
+          ],
+          "answer": [
+            "C"
+          ],
+          "explanation": "",
+          "multi_select": false
+        },
+        {
+          "id": "ew_011",
+          "category": "SAS",
+          "question": "Can SAS jamming be used to support friendly aircraft?",
+          "choices": [
+            "YES",
+            "NO"
+          ],
+          "answer": [
+            "B"
+          ],
+          "explanation": "",
+          "multi_select": false
+        },
+        {
+          "id": "ew_012",
+          "category": "Noise Jamming",
+          "question": "Can noise jamming be used to support friendly aircraft?",
+          "choices": [
+            "YES",
+            "NO"
+          ],
+          "answer": [
+            "A"
+          ],
+          "explanation": "",
+          "multi_select": false
+        },
+        {
+          "id": "ew_013",
+          "category": "XMIT Page",
+          "question": "What color denotes noise jamming on the XMIT page?",
+          "choices": [
+            "Orange",
+            "Red",
+            "Blue",
+            "Green"
+          ],
+          "answer": [
+            "A"
+          ],
+          "explanation": "",
+          "multi_select": false
+        },
+        {
+          "id": "ew_014",
+          "category": "XMIT Page",
+          "question": "What color denotes DRFM jamming on the XMIT page?",
+          "choices": [
+            "Orange",
+            "Red",
+            "Blue",
+            "Green"
+          ],
+          "answer": [
+            "D"
+          ],
+          "explanation": "",
+          "multi_select": false
+        },
+        {
+          "id": "ew_015",
+          "category": "XMIT Page",
+          "question": "What color denotes SAS jamming on the XMIT page?",
+          "choices": [
+            "Orange",
+            "Red",
+            "Blue",
+            "Green"
+          ],
+          "answer": [
+            "C"
+          ],
+          "explanation": "",
+          "multi_select": false
+        },
+        {
+          "id": "ew_016",
+          "category": "MALD",
+          "question": "What is the brevity code for the ADM-160J MALD?",
+          "choices": [
+            "Joker",
+            "Raygun",
+            "Trojan",
+            "Sidearm"
+          ],
+          "answer": [
+            "C"
+          ],
+          "explanation": "",
+          "multi_select": false
+        },
+        {
+          "id": "ew_017",
+          "category": "MALD",
+          "question": "What is the rough flight time for a MALD?",
+          "choices": [
+            "5 minutes",
+            "8 minutes",
+            "12 minutes",
+            "15 minutes"
+          ],
+          "answer": [
+            "B"
+          ],
+          "explanation": "",
+          "multi_select": false
+        },
+        {
+          "id": "ew_018",
+          "category": "MALD",
+          "question": "Does a MALD need to be configured before launch?",
+          "choices": [
+            "YES",
+            "NO"
+          ],
+          "answer": [
+            "B"
+          ],
+          "explanation": "",
+          "multi_select": false
+        },
+        {
+          "id": "ew_019",
+          "category": "MALD",
+          "question": "Can a MALD be given a new target/waypoint midflight?",
+          "choices": [
+            "YES",
+            "NO"
+          ],
+          "answer": [
+            "A"
+          ],
+          "explanation": "",
+          "multi_select": false
+        },
+        {
+          "id": "ew_020",
+          "category": "MALD",
+          "question": "Can a MALD follow a GPS path?",
+          "choices": [
+            "YES",
+            "NO"
+          ],
+          "answer": [
+            "A"
+          ],
+          "explanation": "",
+          "multi_select": false
+        },
+        {
+          "id": "ew_021",
+          "category": "EF-24G",
+          "question": "How many jamming signals can 1 EF-24G transmit at once with jamming pods?",
+          "choices": [
+            "12",
+            "10",
+            "14",
+            "8"
+          ],
+          "answer": [
+            "D"
+          ],
+          "explanation": "",
+          "multi_select": false
+        },
+        {
+          "id": "ew_022",
+          "category": "Jamming Power",
+          "question": "What does increasing jamming power while noise jamming do?",
+          "choices": [
+            "Increases the noise on enemy radars",
+            "Disables enemy radars when close enough",
+            "Reduces burn-through range",
+            "Both A & C",
+            "All of the Above"
+          ],
+          "answer": [
+            "D"
+          ],
+          "explanation": "",
+          "multi_select": false
+        },
+        {
+          "id": "ew_023",
+          "category": "Jamming Power",
+          "question": "What does increasing jamming power while DRFM jamming do?",
+          "choices": [
+            "Increases number of false contacts",
+            "Increases jamming range while DRFM jamming",
+            "Increases effectiveness of RGPO",
+            "Both A & C",
+            "All of the Above"
+          ],
+          "answer": [
+            "D"
+          ],
+          "explanation": "",
+          "multi_select": false
+        },
+        {
+          "id": "ew_024",
+          "category": "Jamming Power",
+          "question": "What does increasing jamming power while SAS jamming do?",
+          "choices": [
+            "Increases detection range of the jamming aircraft",
+            "Increases the number of false contacts",
+            "Reduces burn-through range",
+            "Increases the number of aircraft the jamming aircraft appears as on radar"
+          ],
+          "answer": [
+            "D"
+          ],
+          "explanation": "",
+          "multi_select": false
+        },
+        {
+          "id": "ew_025",
+          "category": "Radar Use",
+          "question": "Can the radar be used while noise jamming?",
+          "choices": [
+            "YES",
+            "NO"
+          ],
+          "answer": [
+            "B"
+          ],
+          "explanation": "",
+          "multi_select": false
+        },
+        {
+          "id": "ew_026",
+          "category": "Radar Use",
+          "question": "Can the radar be used while DRFM or SAS jamming?",
+          "choices": [
+            "YES",
+            "NO"
+          ],
+          "answer": [
+            "A"
+          ],
+          "explanation": "",
+          "multi_select": false
+        },
+        {
+          "id": "ew_027",
+          "category": "HOJ",
+          "question": "How can you protect yourself from HOJ?",
+          "choices": [
+            "Jam using MALDS",
+            "Decrease jamming power",
+            "Reactively turn off jammers for a few seconds",
+            "Both A & C",
+            "All of the Above"
+          ],
+          "answer": [
+            "D"
+          ],
+          "explanation": "",
+          "multi_select": false
+        },
+        {
+          "id": "ew_028",
+          "category": "Tactical Scenarios",
+          "question": "You are jamming a DS radar when you get a warning on your MWS but never got an RWR warning. What should you do?",
+          "choices": [
+            "Assume it was a friendly deploying munitions and ignore it",
+            "DRFM jam to attempt to break the missile lock",
+            "Stop all jamming and change heading",
+            "Deploy countermeasures",
+            "Both C & D",
+            "All of the Above"
+          ],
+          "answer": [
+            "E"
+          ],
+          "explanation": "",
+          "multi_select": false
+        },
+        {
+          "id": "ew_029",
+          "category": "Tactical Scenarios",
+          "question": "While jamming SAM sites, one manages to get an STT lock on you and you see smoke in the air. What should you do?",
+          "choices": [
+            "Jam the radar locking you in DRFM mode",
+            "Perform evasive maneuvers",
+            "Change the heading you are flying",
+            "Wait for the missile to go Pitbull and attempt to jam it",
+            "Both A & C",
+            "All of the Above"
+          ],
+          "answer": [
+            "F"
+          ],
+          "explanation": "",
+          "multi_select": false
+        },
+        {
+          "id": "ew_030",
+          "category": "Tactical Scenarios",
+          "question": "You are tasked with covering flights during RTB. What should you do?",
+          "choices": [
+            "Launch MALD's to jam while you are RTB",
+            "Fly out of the AO first and jam for the other flights",
+            "Jam all remaining radars at as high a power as possible",
+            "SAS jam at max power so that any radars will target you instead of other flights",
+            "Both A & C",
+            "All of the Above"
+          ],
+          "answer": [
+            "E"
+          ],
+          "explanation": "",
+          "multi_select": false
+        }
+      ],
+      "notes": [
+        "This draft contains only the multiple-choice questions supported by /ew quiz v1.",
+        "Questions with answer = TODO must be replaced with A, B, C, D, etc. before deploying.",
+        "The attempt-count question is excluded because eq_quiz_attempts already tracks attempts.",
+        "Free-response questions are excluded because /ew quiz v1 is auto-graded multiple choice only."
+      ]
+    }
+  }
+}
