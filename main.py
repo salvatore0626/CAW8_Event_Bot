@@ -3,13 +3,14 @@ import asyncio
 import discord
 from discord.ext import commands
 
-from config import DISCORD_TOKEN, GUILD_ID
+from config import DISCORD_TOKEN, GUILD_ID, DATABASE_PATH
 from database import init_db
 
 class AirBossBot(commands.Bot):
     async def setup_hook(self):
         await self.load_extension("watchdog")
         await self.load_extension("cogs.user_settings")
+        await self.load_extension("cogs.weekly_report")
         await self.load_extension("cogs.get_qualified")
         await self.load_extension("cogs.requests")
         await self.load_extension("cogs.paperwork")
@@ -19,9 +20,11 @@ class AirBossBot(commands.Bot):
         await self.load_extension("cogs.scheduleview")
         await self.load_extension("cogs.flightlead")
         await self.load_extension("cogs.flightlead_reminders")
+        await self.load_extension("cogs.op_execution_reminders")
         await self.load_extension("cogs.op_lifecycle")
         await self.load_extension("cogs.attend")
         await self.load_extension("cogs.recordedit")
+        await self.load_extension("cogs.admin_log")
         await self.load_extension("cogs.promotions")
         await self.load_extension("cogs.op_templates")
         await self.load_extension("cogs.rewards")
@@ -32,6 +35,8 @@ class AirBossBot(commands.Bot):
         await self.load_extension("cogs.ew_quiz")
         await self.load_extension("cogs.asvab")
         await self.load_extension("cogs.after_action")
+        await self.load_extension("cogs.availability")
+        await self.load_extension("cogs.situation_room")
 
         if GUILD_ID:
             guild = discord.Object(id=GUILD_ID)
@@ -47,6 +52,7 @@ async def main():
         raise RuntimeError("Missing DISCORD_TOKEN in .env")
 
     init_db()
+    print(f"✅ Airboss database initialized: {DATABASE_PATH}")
 
     intents = discord.Intents.default()
     intents.guilds = True

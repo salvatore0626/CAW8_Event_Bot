@@ -29,7 +29,10 @@ class Watchdog(commands.Cog):
 
         for guild in self.bot.guilds:
             print(f"🔄 Syncing users for guild: {guild.name} ({guild.id})")
-            await sync_guild_users(guild)
+            await sync_guild_users(
+                guild,
+                performed_by_id=(self.bot.user.id if self.bot.user else None),
+            )
             print(f"✅ User sync complete for guild: {guild.name}")
 
     @commands.Cog.listener()
@@ -53,7 +56,7 @@ class Watchdog(commands.Cog):
         if member.bot:
             return
 
-        from database import upsert_user
+        from database import deny_qual_requests_for_departed_user, upsert_user
 
         rank = get_highest_rank_from_member(member)
 
@@ -65,7 +68,15 @@ class Watchdog(commands.Cog):
             status="MIA",
         )
 
-        print(f"🚪 Member left, marked MIA: {member.display_name} ({member.id})")
+        denied_quals = deny_qual_requests_for_departed_user(
+            str(member.id),
+            performed_by_id=(self.bot.user.id if self.bot.user else None),
+        )
+
+        print(
+            f"🚪 Member left, marked MIA: {member.display_name} ({member.id})"
+            f" | qualification requests denied: {denied_quals}"
+        )
 
     @commands.Cog.listener()
     async def on_member_update(
@@ -74,9 +85,10 @@ class Watchdog(commands.Cog):
         after: discord.Member,
     ):
         """
-        Watches for rank role changes.
+        Watches for member changes that should refresh users table.
 
-        If the user's highest rank role changes, update the users table.
+        This keeps Discord display names current between bot restarts and also
+        preserves the existing rank-role sync behavior.
         """
         if after.bot:
             return
@@ -84,12 +96,76 @@ class Watchdog(commands.Cog):
         before_rank = get_highest_rank_from_member(before)
         after_rank = get_highest_rank_from_member(after)
 
-        if before_rank != after_rank:
-            sync_member_to_users_table(after)
+        rank_changed = before_rank != after_rank
+        display_name_changed = before.display_name != after.display_name
+        username_changed = before.name != after.name
+        global_name_changed = (
+            getattr(before, "global_name", None)
+            != getattr(after, "global_name", None)
+        )
 
+        if not (
+            rank_changed
+            or display_name_changed
+            or username_changed
+            or global_name_changed
+        ):
+            return
+
+        sync_member_to_users_table(after)
+
+        if rank_changed:
             print(
                 f"🎖️ Rank updated: {after.display_name} "
                 f"{before_rank} -> {after_rank}"
+            )
+
+        if display_name_changed or username_changed or global_name_changed:
+            print(
+                f"🪪 Member name updated: "
+                f"{before.display_name} -> {after.display_name} ({after.id})"
+            )
+
+    @commands.Cog.listener()
+    async def on_user_update(
+        self,
+        before: discord.User,
+        after: discord.User,
+    ):
+        """
+        Watches for account-level username/global name changes.
+
+        Nickname changes usually arrive through on_member_update. Username and
+        global display-name changes can arrive through on_user_update, so we
+        refresh any cached guild member record for that user.
+        """
+        if after.bot:
+            return
+
+        username_changed = before.name != after.name
+        global_name_changed = (
+            getattr(before, "global_name", None)
+            != getattr(after, "global_name", None)
+        )
+
+        if not (username_changed or global_name_changed):
+            return
+
+        synced = False
+
+        for guild in self.bot.guilds:
+            member = guild.get_member(after.id)
+
+            if member is None:
+                continue
+
+            sync_member_to_users_table(member)
+            synced = True
+
+        if synced:
+            print(
+                f"🪪 User account name updated: "
+                f"{before.name} -> {after.name} ({after.id})"
             )
 
 

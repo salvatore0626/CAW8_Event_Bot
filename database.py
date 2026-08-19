@@ -32,6 +32,8 @@ def migrate_user_settings_schema(conn: sqlite3.Connection) -> None:
         "notify_flightlead",
         "notify_instructor",
         "notify_training",
+        "notify_weekly_report",
+        "notify_operations",
     }
 
     existing_table = conn.execute(
@@ -55,6 +57,8 @@ def migrate_user_settings_schema(conn: sqlite3.Connection) -> None:
                 notify_flightlead INTEGER NOT NULL DEFAULT 1,
                 notify_instructor INTEGER NOT NULL DEFAULT 0,
                 notify_training INTEGER NOT NULL DEFAULT 0,
+                notify_weekly_report INTEGER NOT NULL DEFAULT 0,
+                notify_operations INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (discord_id) REFERENCES users(discord_id) ON DELETE CASCADE
             )
             """
@@ -86,6 +90,8 @@ def migrate_user_settings_schema(conn: sqlite3.Connection) -> None:
             notify_flightlead INTEGER NOT NULL DEFAULT 1,
             notify_instructor INTEGER NOT NULL DEFAULT 0,
             notify_training INTEGER NOT NULL DEFAULT 0,
+            notify_weekly_report INTEGER NOT NULL DEFAULT 0,
+            notify_operations INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (discord_id) REFERENCES users(discord_id) ON DELETE CASCADE
         )
         """
@@ -112,6 +118,8 @@ def migrate_user_settings_schema(conn: sqlite3.Connection) -> None:
         # Only preserve these if the new column already existed.
         notify_instructor = int(row["notify_instructor"] or 0) if "notify_instructor" in old_column_names else 0
         notify_training = int(row["notify_training"] or 0) if "notify_training" in old_column_names else 0
+        notify_weekly_report = int(row["notify_weekly_report"] or 0) if "notify_weekly_report" in old_column_names else 0
+        notify_operations = int(row["notify_operations"] or 0) if "notify_operations" in old_column_names else 0
 
         conn.execute(
             """
@@ -122,9 +130,11 @@ def migrate_user_settings_schema(conn: sqlite3.Connection) -> None:
                 notify_end,
                 notify_flightlead,
                 notify_instructor,
-                notify_training
+                notify_training,
+                notify_weekly_report,
+                notify_operations
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(discord_id),
@@ -134,6 +144,8 @@ def migrate_user_settings_schema(conn: sqlite3.Connection) -> None:
                 1 if notify_flightlead else 0,
                 1 if notify_instructor else 0,
                 1 if notify_training else 0,
+                1 if notify_weekly_report else 0,
+                1 if notify_operations else 0,
             ),
         )
 
@@ -177,6 +189,8 @@ def init_db() -> None:
                 notify_flightlead INTEGER NOT NULL DEFAULT 1,
                 notify_instructor INTEGER NOT NULL DEFAULT 0,
                 notify_training INTEGER NOT NULL DEFAULT 0,
+                notify_weekly_report INTEGER NOT NULL DEFAULT 0,
+                notify_operations INTEGER NOT NULL DEFAULT 0,
 
                 FOREIGN KEY (discord_id) REFERENCES users(discord_id) ON DELETE CASCADE
             );
@@ -388,12 +402,139 @@ def update_user_rank(
         )
 
 
-def mark_users_not_in_server_as_mia(current_member_ids: set[str]) -> int:
+
+AUTOMATED_DEPARTURE_AUDIT_REASON = "Automated: User left server"
+
+
+def _active_qual_requests_for_departed_user(
+    conn: sqlite3.Connection,
+    discord_id: str,
+) -> list[dict[str, object]]:
+    rows = conn.execute(
+        """
+        SELECT id, status
+        FROM request_qual
+        WHERE discord_id = ?
+          AND LOWER(COALESCE(status, '')) IN ('pending', 'mia')
+        ORDER BY id ASC
+        """,
+        (discord_id,),
+    ).fetchall()
+    return [
+        {
+            "request_id": int(row["id"]),
+            "status": str(row["status"] or ""),
+        }
+        for row in rows
+    ]
+
+
+def _log_automated_departure_denials(
+    *,
+    discord_id: str,
+    performed_by_id: str | int | None,
+    requests: list[dict[str, object]],
+) -> None:
+    if performed_by_id is None or not requests:
+        return
+
+    # Local import avoids an import cycle because admin_log_service imports
+    # database.get_connection(). This helper is called after the denial write
+    # transaction has closed so the audit insert uses a clean connection.
+    from services.admin_log_service import log_admin_action
+
+    for request in requests:
+        request_id = int(request["request_id"])
+        previous_status = str(request.get("status") or "")
+        log_admin_action(
+            action="request_denied",
+            user_discord_id=discord_id,
+            performed_by_id=performed_by_id,
+            before_json={
+                "request_id": request_id,
+                "status": previous_status,
+            },
+            after_json={
+                "request_id": request_id,
+                "status": "denied",
+            },
+            reason=AUTOMATED_DEPARTURE_AUDIT_REASON,
+        )
+
+
+def deny_qual_requests_for_departed_user(
+    discord_id: str,
+    *,
+    performed_by_id: str | int | None = None,
+) -> int:
     """
-    Any user in the database but not currently in the Discord server
-    becomes MIA.
+    Deny any still-active qualification request for a user who left Discord.
+
+    Historical approved/completed/denied/cancelled requests are preserved.
+    When performed_by_id is supplied, each automatic denial is also written to
+    admin_log as request_denied. Returns the number of request rows changed.
     """
     ts = now_ts()
+
+    with get_connection() as conn:
+        requests = _active_qual_requests_for_departed_user(conn, discord_id)
+        cur = conn.execute(
+            """
+            UPDATE request_qual
+            SET status = 'denied',
+                remarks = 'Auto: Left the server',
+                updated_at = ?
+            WHERE discord_id = ?
+              AND LOWER(COALESCE(status, '')) IN ('pending', 'mia')
+            """,
+            (ts, discord_id),
+        )
+        changed = int(cur.rowcount or 0)
+
+    if changed:
+        _log_automated_departure_denials(
+            discord_id=discord_id,
+            performed_by_id=performed_by_id,
+            requests=requests[:changed],
+        )
+
+    return changed
+
+
+def _deny_departed_user_qual_requests(
+    conn: sqlite3.Connection,
+    discord_id: str,
+    ts: int,
+) -> tuple[int, list[dict[str, object]]]:
+    """Transaction-local version used by startup MIA reconciliation."""
+    requests = _active_qual_requests_for_departed_user(conn, discord_id)
+    cur = conn.execute(
+        """
+        UPDATE request_qual
+        SET status = 'denied',
+            remarks = 'Auto: Left the server',
+            updated_at = ?
+        WHERE discord_id = ?
+          AND LOWER(COALESCE(status, '')) IN ('pending', 'mia')
+        """,
+        (ts, discord_id),
+    )
+    return int(cur.rowcount or 0), requests
+
+
+def mark_users_not_in_server_as_mia(
+    current_member_ids: set[str],
+    *,
+    performed_by_id: str | int | None = None,
+) -> int:
+    """
+    Any user in the database but not currently in the Discord server becomes MIA.
+
+    Qualification requests denied during startup reconciliation are also audited
+    as bot-performed request_denied actions when performed_by_id is supplied.
+    """
+    ts = now_ts()
+    audit_events: list[tuple[str, list[dict[str, object]]]] = []
 
     with get_connection() as conn:
         rows = conn.execute(
@@ -419,6 +560,22 @@ def mark_users_not_in_server_as_mia(current_member_ids: set[str]) -> int:
                     """,
                     (ts, discord_id),
                 )
+                denied_count, denied_requests = _deny_departed_user_qual_requests(
+                    conn,
+                    discord_id,
+                    ts,
+                )
+                if denied_count:
+                    audit_events.append(
+                        (discord_id, denied_requests[:denied_count])
+                    )
                 changed += 1
+
+    for discord_id, requests in audit_events:
+        _log_automated_departure_denials(
+            discord_id=discord_id,
+            performed_by_id=performed_by_id,
+            requests=requests,
+        )
 
     return changed

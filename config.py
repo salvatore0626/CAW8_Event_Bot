@@ -1,7 +1,18 @@
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+
+def _resolve_bot_path(env_name: str, default_path: Path) -> str:
+    """Resolve bot-local paths from this bot folder, not the process cwd."""
+    raw_value = os.getenv(env_name)
+    path = Path(raw_value) if raw_value else default_path
+    if not path.is_absolute():
+        path = BASE_DIR / path
+    return str(path.resolve())
+
+load_dotenv(BASE_DIR / ".env")
 
 
 # =========================================================
@@ -10,7 +21,7 @@ load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
-DATABASE_PATH = os.getenv("DATABASE_PATH", "airboss.db")
+DATABASE_PATH = _resolve_bot_path("DATABASE_PATH", BASE_DIR / "airboss.db")
 
 
 # =========================================================
@@ -42,12 +53,16 @@ RANK_ROLES = [
         "role_id": 1514674842350125128,
     },
     {
-        "rank": "Ensign",
+        "rank": "ENS",
         "role_id": 1514674950902911048,
     },
     {
         "rank": "LTJG",
         "role_id": 1514675012781740102,
+    },
+    {
+        "rank": "LT",
+        "role_id": 1537501830328623224,
     },
     {
         "rank": "LCDR",
@@ -60,6 +75,14 @@ RANK_ROLES = [
     {
         "rank": "CAPT",
         "role_id": 1514675302310346872,
+    },
+    {
+        "rank": "ADM",
+        "role_id": 1514675710353080391,
+    },
+    {
+        "rank": "RADM",
+        "role_id": 1514675767932616736,
     },
     {
         "rank": "XO",
@@ -78,14 +101,6 @@ RANK_ROLES = [
         "role_id": 1514675632993337396,
     },
     {
-        "rank": "ADM",
-        "role_id": 1514675710353080391,
-    },
-    {
-        "rank": "RADM",
-        "role_id": 1514675767932616736,
-    },
-    {
         "rank": "SECNAV",
         "role_id": 1514676954970984661,
     },
@@ -97,6 +112,7 @@ DEFAULT_RANK = "Recruit"
 # =========================================================
 # OPERATION TEMPLATE SETTINGS
 # =========================================================
+OP_TEMPLATE_REMARKS_PER_PAGE = 5
 
 OP_TYPES = [
     "Normal",
@@ -110,7 +126,7 @@ OP_TYPES = [
 # Discord selects can only show 25 options max.
 AIRCRAFT_OPTIONS = [
     {"name": "AV-42C", "max_seats": 1},
-    {"name": "F/A-26", "max_seats": 1},
+    {"name": "F/A-26B", "max_seats": 1},
     {"name": "F-45A", "max_seats": 1},
     {"name": "EF-24", "max_seats": 2},
     {"name": "T-55", "max_seats": 2},
@@ -118,30 +134,58 @@ AIRCRAFT_OPTIONS = [
     {"name": "F-16C", "max_seats": 1},
     {"name": "A-10D", "max_seats": 1},
     {"name": "AH-6", "max_seats": 2},
+    {"name": "F-5E", "max_seats": 1},
+    {"name": "F-22A", "max_seats": 1},
+    {"name": "AV-8B", "max_seats": 1},
 ]
 
+# =========================================================
+# OPERATION LIFECYCLE
+# =========================================================
+
+OPERATION_LIFECYCLE_CHANNEL_ID = 1511787829338968206
 
 # =========================================================
 # TIMEZONE OPTIONS
 # Discord dropdowns can only show up to 25 options.
+# Limited to 24. one slot reserver for manual db set timezones
 # =========================================================
 
 TIMEZONE_OPTIONS = [
-    ("Eastern Time", "America/New_York"),
-    ("Central Time", "America/Chicago"),
-    ("Mountain Time", "America/Denver"),
-    ("Pacific Time", "America/Los_Angeles"),
-    ("Alaska Time", "America/Anchorage"),
-    ("Hawaii Time", "Pacific/Honolulu"),
-    ("UTC", "UTC"),
+    # North America
+    ("Eastern (US/Canada)", "America/New_York"),
+    ("Central (US/Canada)", "America/Chicago"),
+    ("Mountain (US/Canada)", "America/Denver"),
+    ("Arizona", "America/Phoenix"),
+    ("Pacific (US/Canada)", "America/Los_Angeles"),
+    ("Alaska", "America/Anchorage"),
+    ("Hawaii", "Pacific/Honolulu"),
+
+    # Latin America
+    ("Mexico Central", "America/Mexico_City"),
+    ("Brazil (São Paulo)", "America/Sao_Paulo"),
+    ("Argentina", "America/Argentina/Buenos_Aires"),
+
+    # Europe
     ("United Kingdom", "Europe/London"),
-    ("Ireland", "Europe/Dublin"),
     ("Central Europe", "Europe/Berlin"),
-    ("Western Europe", "Europe/Paris"),
     ("Eastern Europe", "Europe/Helsinki"),
-    ("Brazil", "America/Sao_Paulo"),
+
+    # Middle East / Africa
+    ("Israel", "Asia/Jerusalem"),
+    ("Saudi Arabia / Gulf", "Asia/Riyadh"),
+    ("UAE / Oman", "Asia/Dubai"),
+    ("South Africa", "Africa/Johannesburg"),
+
+    # Asia
+    ("India", "Asia/Kolkata"),
+    ("China", "Asia/Shanghai"),
+    ("Singapore / Malaysia", "Asia/Singapore"),
+    ("Japan", "Asia/Tokyo"),
+    ("South Korea", "Asia/Seoul"),
+
+    # Oceania
     ("Australia East", "Australia/Sydney"),
-    ("Australia West", "Australia/Perth"),
     ("New Zealand", "Pacific/Auckland"),
 ]
 
@@ -187,6 +231,7 @@ TIME_OPTIONS = [
     ("11 PM", "23:00"),
 ]
 
+QUAL_REQUEST_PING_CHANNEL_ID = 1525320862708928563
 
 # =========================================================
 # INSTRUCTOR QUALIFICATION OPTIONS
@@ -218,8 +263,9 @@ SCHEDULE_DEFAULT_SLOTS = [
 
 OP_EVENT_MEETING_VCS = [
     1514318655406604340,
-    1511788093227663431,
-
+    1511590911463653526,
+    1519845023238324306,
+    1519845066141728879,
 ]
 
 SCHEDULE_EVENT_DURATION_HOURS = 2
@@ -266,7 +312,7 @@ PROMOTION_REQUIREMENTS = {
     },
 }
 
-PROMOTION_ANNOUNCEMENT_CHANNEL_ID = 1465203828386173105
+PROMOTION_ANNOUNCEMENT_CHANNEL_ID = 1511787829338968206
 
 # Single promotion announcement.
 PROMOTION_SINGLE_TEMPLATE = (
@@ -318,6 +364,7 @@ OP_FLIGHT_VC_UPDATE_DELAY_SECONDS = 1.2
 # =========================================================
 # SITUATION ROOM
 # =========================================================
+SITUATION_ROOM_STATE_FILE = "data/situation_room_messages.json"
 
 # Text channel where the bot posts reservation and attendance status boards.
 SITUATION_ROOM_CHANNEL_ID = 1513972262582358087
@@ -348,7 +395,7 @@ LEADERBOARD_CHANNEL_ID = 1514334108225114234
 LEADERBOARD_WINDOW_DAYS = 50
 
 # Persistent board-message state. Created and maintained automatically.
-LEADERBOARD_STATE_FILE = "leaderboard_messages.json"
+LEADERBOARD_STATE_FILE = "data/leaderboard_messages.json"
 
 # Changes from /complete or /recordedit are combined for this long before
 # the automatic reward reconciliation and leaderboard refresh run.
@@ -363,7 +410,8 @@ LEADERBOARD_MIN_SURVIVAL_OPS = 10
 # Display limits for the persistent leaderboard messages.
 LEADERBOARD_TOP_LIMIT = 10
 LEADERBOARD_AWARD_LIST_LIMIT = 25
-LEADERBOARD_RECENT_HIGHLIGHT_DAYS = 25
+LEADERBOARD_RECENT_HIGHLIGHT_DAYS = 7
+LEADERBOARD_RECENT_HIGHLIGHT_EVENT = True
 
 # Carrier sections are shown in this exact order. Change the list later if you
 # want to add AH-94, T-55, or other airframes.
@@ -462,12 +510,12 @@ EW_QUIZ_JSON_PATH = "data/ew_quiz.json"
 TEST_COOLDOWN_HOURS = 24
 
 # Public congratulations channel for passing EW quiz.
-EW_RESULTS_CHANNEL = 1465203828386173105
+EW_RESULTS_CHANNEL = 1511787829338968206
 
 # Optional NATOPS message jump button shown on failed/cooldown/incomplete messages.
 # Discord message links need both channel ID and message ID.
-NATOPS_CHANNEL_ID = 1511787900482621591
-NATOPS_MESSAGE_ID = 1515867916338200698
+NATOPS_CHANNEL_ID = 1519765122304704703
+NATOPS_MESSAGE_ID = 1537503199391383562
 
 # =========================================================
 # ASVAB QUIZ SETTINGS
@@ -479,8 +527,10 @@ ASVAB_JSON_PATH = "data/asvab_quiz.json"
 # The bot tries to pull an equal amount from each category.
 # If a category does not have enough questions, it pulls all available
 # from that category and fills remaining slots from other categories.
-ASVAB_NUMBER_OF_QUESTIONS = 25
-ASVAB_TIME_LIMIT_MINUTES = 60
+ASVAB_NUMBER_OF_QUESTIONS = 60
+ASVAB_TIME_LIMIT_MINUTES = 40
+
+ASVAB_RESULTS_CHANNEL = 1511787829338968206
 
 # =========================================================
 # FLIGHT LEAD REMINDERS
@@ -500,17 +550,19 @@ TRAINING_TOPICS = [
     {"key": "case_1", "label": "Case 1"},
     {"key": "case_2", "label": "Case 2"},
     {"key": "case_3", "label": "Case 3"},
+    {"key": "ew", "label": "Electronic Warfare"},
     {"key": "heli_case_1", "label": "Heli Case 1"},
     {"key": "a2g_weapons", "label": "A2G Weapons"},
     {"key": "a2a_combat", "label": "A2A Combat"},
-    {"key": "ew", "label": "EW"},
+    {"key": "air_refuel", "label": "Aerial Refueling"},
+    {"key": "formation_flying", "label": "Formation Flying"},
 ]
 
 TRAINING_DM_COOLDOWN_MINUTES = 2
 
 TRAINING_ROSTER_VOICE_CATEGORY_IDS = [
-    1519844972185256047,
-    1511787800423301342
+    1519845023238324306,
+    1519845066141728879,
 ]
 
 # =========================================================
@@ -539,3 +591,52 @@ RANK_PRUNE_PREFIXES = [
     "CAG. ENS.",
     "Recruit",
 ]
+
+# =========================================================
+# Greenie Board
+# =========================================================
+# How many recent landing attempts to show in the Discord embed message.
+# This is per airframe, not total.
+GREENIE_ATTEMPT_HISTORY_LENGTH = 16
+
+# True = only count completed ops where op_templates.type == "Normal"
+# False = count all completed op types.
+GREENIE_NORMAL_OPS_ONLY = True
+
+# Display / legend order for Greenie-supported carrier aircraft.
+# Only default unmodded VTOL VR wire-catching aircraft should be here.
+GREENIE_AIRFRAME_ORDER = [
+    "F/A-26B",
+    "F-45A",
+    "EF-24G",
+    "T-55",
+    "AV-42C",
+]
+
+# Rolling average window used by the PNG graph line.
+# Example: 5 means "trailing 5 attempt average."
+GREENIE_GPA_ROLLING_AVERAGE_RANGE = 5
+
+
+# =========================================================
+# WEEKLY SERVER REPORT
+# =========================================================
+
+# Number of complete report-day-to-report-day weeks shown on both graphs.
+WEEKLY_REPORT_WEEKS_BACK = 8
+
+# ISO weekday: 1=Monday, 2=Tuesday, 3=Wednesday, ... 7=Sunday.
+# With 3, all report/chart buckets are Wednesday 00:00 -> Wednesday 00:00.
+WEEKLY_REPORT_DAY = 6
+
+# Airboss reads the NCIS database read-only.
+WEEKLY_REPORT_NCIS_DATABASE_PATH = _resolve_bot_path(
+    "NCIS_DATABASE_PATH",
+    BASE_DIR.parent / "NCIS Database" / "caw8.db",
+)
+
+# Cached report JSON and PNG files.
+WEEKLY_REPORT_OUTPUT_DIR = _resolve_bot_path(
+    "WEEKLY_REPORT_OUTPUT_DIR",
+    BASE_DIR / "data" / "weekly_report",
+)
