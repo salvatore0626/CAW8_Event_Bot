@@ -16,6 +16,7 @@ except ImportError:
     FLIGHTLEAD_REMINDER_LOOP_SECONDS = 60
     FLIGHTLEAD_REMINDER_MINUTES_BEFORE = 60
 
+from services.user_settings_service import safe_zoneinfo
 from services.flightlead_reminder_service import (
     FlightLeadReminderCandidate,
     due_flightlead_reminders,
@@ -46,15 +47,7 @@ def is_within_notification_window(
     notify_start: str | None,
     notify_end: str | None,
 ) -> bool:
-    if not timezone:
-        return False
-
-    try:
-        local_now = datetime.now(ZoneInfo(str(timezone)))
-    except ZoneInfoNotFoundError:
-        return False
-    except Exception:
-        return False
+    local_now = datetime.now(safe_zoneinfo(timezone))
 
     now_minutes = local_now.hour * 60 + local_now.minute
     start_minutes = parse_notification_time(notify_start, "09:00")

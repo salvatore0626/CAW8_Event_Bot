@@ -8,6 +8,13 @@ from discord import app_commands
 from discord.ext import commands
 
 from config import INSTRUCTOR_ROLE, MIN_VTOL_HOURS, TIME_OPTIONS
+
+try:
+    from config import QUAL_REQUEST_PING_CHANNEL_ID
+except ImportError:
+    QUAL_REQUEST_PING_CHANNEL_ID = 0
+from services.user_settings_service import safe_zoneinfo
+from services.admin_log_service import log_admin_action
 from services.qual_request_review_service import (
     QualRequestRecord,
     deny_qual_request,
@@ -49,6 +56,7 @@ ORDER_OPTIONS = [
 FILTER_OPTIONS = [
     ("Online Now", "online_now"),
     ("Available Now", "available_now"),
+    ("Available Today", "available_today"),
     ("Age 13+: No", "age_no"),
     ("Under VTOL Hours", "under_vtol_hours"),
 ]
@@ -179,15 +187,7 @@ def is_request_user_online(
 
 
 def get_local_datetime(request: QualRequestRecord) -> datetime | None:
-    if not request.timezone:
-        return None
-
-    try:
-        return datetime.now(ZoneInfo(request.timezone))
-    except ZoneInfoNotFoundError:
-        return None
-    except Exception:
-        return None
+    return datetime.now(safe_zoneinfo(request.timezone))
 
 
 def local_time_text(request: QualRequestRecord) -> str:
@@ -241,6 +241,48 @@ def is_request_available_now(request: QualRequestRecord) -> bool:
         return False
 
     return start_idx <= current_idx < end_idx
+
+
+def is_request_available_today(request: QualRequestRecord) -> bool:
+    """Return True when the requester has remaining availability at some point today.
+
+    "Today" is evaluated in the requester's configured timezone, matching the
+    existing Available Now filter. A window that already ended earlier today
+    does not count.
+    """
+    if (
+        not request.timezone
+        or not request.dotw
+        or not request.availability_start
+        or not request.availability_end
+    ):
+        return False
+
+    local_now = get_local_datetime(request)
+    if local_now is None:
+        return False
+
+    current_day = local_now.strftime("%A")
+    available_days = {
+        day.strip()
+        for day in request.dotw.split(",")
+        if day.strip()
+    }
+
+    if current_day not in available_days:
+        return False
+
+    start_idx = time_index(request.availability_start)
+    end_idx = time_index(request.availability_end)
+    if start_idx is None or end_idx is None or start_idx >= end_idx:
+        return False
+
+    # TIME_OPTIONS are hourly values. Compare against exact local minutes so a
+    # user drops out as soon as their submitted availability window has ended.
+    end_hour, end_minute = map(int, request.availability_end.split(":"))
+    end_minutes = (end_hour * 60) + end_minute
+    now_minutes = (local_now.hour * 60) + local_now.minute
+    return end_minutes > now_minutes
 
 
 def is_under_minimum_vtol_hours(request: QualRequestRecord) -> bool:
@@ -318,6 +360,9 @@ class QualRequestReviewSession:
             return False
 
         if "available_now" in self.filter_modes and not is_request_available_now(request):
+            return False
+
+        if "available_today" in self.filter_modes and not is_request_available_today(request):
             return False
 
         if "age_no" in self.filter_modes and not is_age_no(request):
@@ -796,7 +841,7 @@ class FilterSelect(discord.ui.Select):
         super().__init__(
             placeholder="Filter",
             min_values=0,
-            max_values=4,
+            max_values=len(FILTER_OPTIONS),
             options=options,
             row=1,
         )
@@ -1094,6 +1139,41 @@ class ConfirmPingView(PrivateTimeoutView):
         return True
 
 
+async def resolve_qual_request_ping_channel(
+    interaction: discord.Interaction,
+) -> discord.abc.Messageable | None:
+    try:
+        channel_id = int(QUAL_REQUEST_PING_CHANNEL_ID or 0)
+    except (TypeError, ValueError):
+        channel_id = 0
+
+    if channel_id <= 0:
+        return None
+
+    channel = None
+    if interaction.guild is not None:
+        channel = interaction.guild.get_channel(channel_id)
+
+    if channel is None:
+        channel = interaction.client.get_channel(channel_id)
+
+    if channel is None:
+        try:
+            channel = await interaction.client.fetch_channel(channel_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return None
+
+    channel_guild = getattr(channel, "guild", None)
+    if interaction.guild is not None and channel_guild is not None:
+        if channel_guild.id != interaction.guild.id:
+            return None
+
+    if not hasattr(channel, "send"):
+        return None
+
+    return channel
+
+
 class ConfirmPingButton(discord.ui.Button):
     def __init__(
         self,
@@ -1125,9 +1205,13 @@ class ConfirmPingButton(discord.ui.Button):
         self.mode = mode
 
     async def callback(self, interaction: discord.Interaction):
-        if interaction.channel is None:
+        ping_channel = await resolve_qual_request_ping_channel(interaction)
+        if ping_channel is None:
             await interaction.response.send_message(
-                "I could not find the current channel to send a ping.",
+                (
+                    "Qualification ping channel is not configured or cannot be accessed. "
+                    "Set `QUAL_REQUEST_PING_CHANNEL_ID` in config.py to a channel the bot can send messages in."
+                ),
                 ephemeral=True,
             )
             return
@@ -1163,7 +1247,7 @@ class ConfirmPingButton(discord.ui.Button):
             )
             return
 
-        await send_ping_messages(interaction.channel, targets, interaction.user.mention)
+        await send_ping_messages(ping_channel, targets, interaction.user.mention)
         increment_qual_request_ping_counts([target.id for target in targets])
 
         self.session.refresh_requests(interaction.guild)
@@ -1441,10 +1525,19 @@ class ActionDenySendButton(discord.ui.Button):
             except Exception:
                 dm_status = "DM failed, but the request was marked denied."
 
+        remarks = self.session.action_remarks
         deny_qual_request(
             request_id=selected.id,
             instructor_discord_id=str(interaction.user.id),
-            remarks=self.session.action_remarks,
+            remarks=remarks,
+        )
+        log_admin_action(
+            action="request_denied",
+            user_discord_id=selected.discord_id,
+            performed_by_id=interaction.user.id,
+            before_json={"request_id": selected.id, "status": selected.status},
+            after_json={"request_id": selected.id, "status": "denied"},
+            reason=remarks,
         )
 
         self.session.action_remarks = None
@@ -1483,10 +1576,19 @@ class ActionMIAConfirmButton(discord.ui.Button):
             )
             return
 
+        remarks = self.session.action_remarks
         mark_qual_request_mia(
             request_id=selected.id,
             instructor_discord_id=str(interaction.user.id),
-            remarks=self.session.action_remarks,
+            remarks=remarks,
+        )
+        log_admin_action(
+            action="request_mia",
+            user_discord_id=selected.discord_id,
+            performed_by_id=interaction.user.id,
+            before_json={"request_id": selected.id, "status": selected.status},
+            after_json={"request_id": selected.id, "status": "mia"},
+            reason=remarks,
         )
 
         self.session.action_remarks = None

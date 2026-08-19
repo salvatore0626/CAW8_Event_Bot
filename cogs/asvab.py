@@ -11,6 +11,11 @@ try:
 except ImportError:
     ASVAB_TIME_LIMIT_MINUTES = 45
 
+try:
+    from config import ASVAB_RESULTS_CHANNEL
+except ImportError:
+    ASVAB_RESULTS_CHANNEL = 0
+
 from services.asvab_service import (
     ASVABQuestionViewData,
     ASVABQuizError,
@@ -169,6 +174,47 @@ def build_results_embed(attempt: dict) -> discord.Embed:
             ),
             inline=True,
         )
+
+    return embed
+
+
+def build_public_results_embed(
+    member: discord.Member,
+    attempt: dict,
+) -> discord.Embed:
+    correct = int(attempt.get("correct_count") or 0)
+    total = int(attempt.get("total_questions") or 0)
+    score = score_text(attempt.get("score_percent"))
+    category_scores = category_score_summary(attempt)
+
+    embed = discord.Embed(
+        title="ASVAB Results",
+        description=(
+            f"{member.mention} completed the **ASVAB**.\n\n"
+            f"Overall Score: **{score}**\n"
+            f"Correct: **{correct}/{total}**"
+        ),
+        color=discord.Color.blurple(),
+        timestamp=discord.utils.utcnow(),
+    )
+
+    for row in category_scores:
+        embed.add_field(
+            name=str(row["category"]),
+            value=(
+                f"Score: **{score_text(row['percent'])}**\n"
+                f"Correct: **{int(row['correct'])}/{int(row['total'])}**"
+            ),
+            inline=True,
+        )
+
+    embed.set_thumbnail(url=member.display_avatar.url)
+
+    attempt_id = attempt.get("attempt_id")
+    footer = f"Applicant: {member.display_name}"
+    if attempt_id is not None:
+        footer += f" | Attempt ID: {attempt_id}"
+    embed.set_footer(text=footer)
 
     return embed
 
@@ -478,6 +524,9 @@ class ASVABQuestionView(discord.ui.View):
             )
             return
 
+        if isinstance(interaction.user, discord.Member):
+            await self.cog.post_result_announcement(interaction.user, attempt)
+
         await interaction.response.edit_message(
             content=None,
             embed=build_results_embed(attempt),
@@ -488,6 +537,37 @@ class ASVABQuestionView(discord.ui.View):
 class ASVABCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+
+    async def post_result_announcement(
+        self,
+        member: discord.Member,
+        attempt: dict,
+    ) -> None:
+        try:
+            channel_id = int(ASVAB_RESULTS_CHANNEL or 0)
+        except (TypeError, ValueError):
+            channel_id = 0
+
+        if not channel_id:
+            return
+
+        channel = member.guild.get_channel(channel_id)
+
+        if channel is None:
+            try:
+                channel = await member.guild.fetch_channel(channel_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                return
+
+        if not isinstance(channel, discord.abc.Messageable):
+            return
+
+        try:
+            await channel.send(
+                embed=build_public_results_embed(member, attempt),
+            )
+        except discord.HTTPException:
+            return
 
     async def cog_load(self):
         ensure_schema()

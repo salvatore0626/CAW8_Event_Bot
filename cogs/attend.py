@@ -35,9 +35,10 @@ from services.situation_room_service import queue_situation_room_refresh
 
 LANDING_TYPES = [
     "Arrested",
-    "Vertical",
     "Airfield",
+    "Vertical",
     "Non-Pilot",
+    "FTR",
     "DNF",
 ]
 
@@ -108,6 +109,11 @@ def page_two_status_lines(draft: AttendDraft) -> list[str]:
         bolter_valid = draft.bolters is not None
         wire_value = str(draft.wires) if wire_valid else "Select wire"
         bolter_value = str(draft.bolters) if bolter_valid else "Select bolters"
+    elif draft.landing_type == "FTR":
+        wire_valid = True
+        bolter_valid = draft.bolters is not None
+        wire_value = "N/A"
+        bolter_value = str(draft.bolters) if bolter_valid else "Select bolters"
     elif draft.landing_type is None:
         wire_valid = False
         bolter_valid = False
@@ -121,14 +127,14 @@ def page_two_status_lines(draft: AttendDraft) -> list[str]:
 
     return [
         ansi_line(
-            "Combat Deaths",
-            str(draft.combat_deaths) if combat_valid else "Select combat deaths",
-            combat_valid,
-        ),
-        ansi_line(
             "Landing Type",
             draft.landing_type if landing_valid else "Select landing type",
             landing_valid,
+        ),
+        ansi_line(
+            "Combat Deaths",
+            str(draft.combat_deaths) if combat_valid else "Select combat deaths",
+            combat_valid,
         ),
         ansi_line("Wire", wire_value, wire_valid),
         ansi_line("Bolters", bolter_value, bolter_valid),
@@ -145,17 +151,39 @@ def is_page_two_complete(draft: AttendDraft) -> bool:
     if draft.landing_type == "Arrested":
         return draft.wires is not None and draft.bolters is not None
 
+    if draft.landing_type == "FTR":
+        return draft.bolters is not None
+
     return True
 
 
 
 
 
-def apply_nonpilot_rules(draft: AttendDraft) -> None:
-    if draft.landing_type == "Non-Pilot":
+def apply_no_stat_rules(draft: AttendDraft) -> None:
+    if draft.landing_type in {"Non-Pilot", "DNF"}:
         draft.combat_deaths = 0
         draft.wires = None
         draft.bolters = None
+
+
+def is_one_one_slot(slot: str | None) -> bool:
+    if not slot:
+        return False
+    return slot.strip().lower().endswith("1-1")
+
+
+def flight_lead_review_allowed(draft: AttendDraft) -> bool:
+    # A pilot occupying a 1-1 slot is the flight lead and should not review themself.
+    # Non-Pilot attendance is the exception because the member may still be reviewing
+    # the flight lead whose 1-1 slot they were associated with.
+    return not (is_one_one_slot(draft.slot) and draft.landing_type != "Non-Pilot")
+
+
+def clear_hidden_flight_lead_review(draft: AttendDraft) -> None:
+    if not flight_lead_review_allowed(draft):
+        draft.flight_lead_rating = None
+        draft.fl_remarks = None
 
 def draft_selected_flight(draft: AttendDraft):
     if draft.flight_index is None:
@@ -222,26 +250,41 @@ def build_page_three_embed(
     draft: AttendDraft,
     timezone_name: str,
 ) -> discord.Embed:
-    rating = "No rating"
-
-    if draft.flight_lead_rating is not None:
-        rating = f"{draft.flight_lead_rating}/5 {stars_for_rating(draft.flight_lead_rating)}"
+    show_flight_lead_review = flight_lead_review_allowed(draft)
 
     remarks_status = [
         "Op review: set" if draft.op_remarks else "Op review: blank",
-        "Flight lead review: set" if draft.fl_remarks else "Flight lead review: blank",
-        "Notes: set" if draft.note_remarks else "Notes: blank",
     ]
+
+    description_lines = [
+        f"**Flight Slot:** {draft.slot or 'Not selected'}",
+        f"**Aircraft:** {draft.aircraft or 'Unknown'}",
+        "",
+    ]
+
+    if show_flight_lead_review:
+        rating = "No rating"
+        if draft.flight_lead_rating is not None:
+            rating = f"{draft.flight_lead_rating}/5 {stars_for_rating(draft.flight_lead_rating)}"
+
+        description_lines.append(f"Flight Lead Rating: `{rating}`")
+        if (
+            draft.flight_lead_rating is not None
+            and draft.flight_lead_rating < 4
+            and not draft.fl_remarks
+        ):
+            description_lines.append("⚠️ Ratings below 4 stars require a Flight lead review remark.")
+
+        remarks_status.append(
+            "Flight lead review: set" if draft.fl_remarks else "Flight lead review: blank"
+        )
+
+    remarks_status.append("Notes: set" if draft.note_remarks else "Notes: blank")
+    description_lines.extend(remarks_status)
 
     embed = discord.Embed(
         title=f"Attend #{draft.event_id} {draft.op_name}",
-        description=(
-            f"**Flight Slot:** {draft.slot or 'Not selected'}\n"
-            f"**Aircraft:** {draft.aircraft or 'Unknown'}\n\n"
-            f"Flight Lead Rating: `{rating}`\n"
-            + ("⚠️ 0-2 star ratings require a Flight lead review remark.\n" if draft.flight_lead_rating is not None and draft.flight_lead_rating <= 2 and not draft.fl_remarks else "")
-            + "\n".join(remarks_status)
-        ),
+        description="\n".join(description_lines),
     )
 
     embed.set_footer(text=f"Displayed in your timezone: {timezone_name}")
@@ -502,10 +545,10 @@ class NextToPageTwoButton(discord.ui.Button):
 class AttendPageTwoView(AttendBaseView):
     def __init__(self, owner_id: int, timezone_name: str, draft: AttendDraft):
         super().__init__(owner_id, timezone_name, draft)
-        apply_nonpilot_rules(self.draft)
+        apply_no_stat_rules(self.draft)
 
-        self.add_item(CombatDeathsSelect(draft))
         self.add_item(LandingTypeSelect(draft))
+        self.add_item(CombatDeathsSelect(draft))
         self.add_item(WireSelect(draft))
         self.add_item(BoltersSelect(draft))
         self.add_item(BackToPageOneButton(row=4))
@@ -548,18 +591,28 @@ class NumberSelect(discord.ui.Select):
 
 class CombatDeathsSelect(NumberSelect):
     def __init__(self, draft: AttendDraft):
-        locked = draft.landing_type == "Non-Pilot"
+        unavailable = draft.landing_type is None
+        locked = draft.landing_type in {"Non-Pilot", "DNF"}
 
-        if locked:
+        if unavailable:
+            options = [
+                discord.SelectOption(
+                    label="Select landing type first",
+                    value="none",
+                    default=True,
+                )
+            ]
+            placeholder = "Select landing type first"
+        elif locked:
             options = [
                 discord.SelectOption(
                     label="Combat Deaths: 0",
                     value="0",
-                    description="Locked to 0 for Non-Pilot attendance.",
+                    description="Locked to 0 for Non-Pilot or DNF attendance.",
                     default=True,
                 )
             ]
-            placeholder = "Combat deaths locked to 0"
+            placeholder = "Combat deaths not applicable"
         else:
             options = self.make_number_options(
                 selected=draft.combat_deaths,
@@ -574,14 +627,17 @@ class CombatDeathsSelect(NumberSelect):
             min_values=1,
             max_values=1,
             options=options,
-            disabled=locked,
-            row=0,
+            disabled=unavailable or locked,
+            row=1,
         )
 
     async def callback(self, interaction: discord.Interaction):
         assert isinstance(self.view, AttendPageTwoView)
 
-        if self.view.draft.landing_type == "Non-Pilot":
+        if self.values[0] == "none":
+            return
+
+        if self.view.draft.landing_type in {"Non-Pilot", "DNF"}:
             self.view.draft.combat_deaths = 0
             await self.view.refresh(interaction)
             return
@@ -607,7 +663,7 @@ class LandingTypeSelect(discord.ui.Select):
             min_values=1,
             max_values=1,
             options=options,
-            row=1,
+            row=0,
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -616,17 +672,21 @@ class LandingTypeSelect(discord.ui.Select):
         previous_landing_type = self.view.draft.landing_type
         self.view.draft.landing_type = self.values[0]
 
-        if self.view.draft.landing_type == "Non-Pilot":
-            apply_nonpilot_rules(self.view.draft)
-        elif previous_landing_type == "Non-Pilot":
+        if self.view.draft.landing_type in {"Non-Pilot", "DNF"}:
+            apply_no_stat_rules(self.view.draft)
+        elif previous_landing_type in {"Non-Pilot", "DNF"}:
             self.view.draft.combat_deaths = None
             self.view.draft.wires = None
             self.view.draft.bolters = None
-        elif self.view.draft.landing_type != "Arrested":
+        elif self.view.draft.landing_type == "FTR":
             self.view.draft.wires = None
-            self.view.draft.bolters = None
-        elif previous_landing_type != "Arrested":
-            # Do not auto-fill. User must intentionally pick wire and bolters.
+            if previous_landing_type not in {"Arrested", "FTR"}:
+                self.view.draft.bolters = None
+        elif self.view.draft.landing_type == "Arrested":
+            if previous_landing_type != "Arrested":
+                self.view.draft.wires = None
+                self.view.draft.bolters = None
+        else:
             self.view.draft.wires = None
             self.view.draft.bolters = None
 
@@ -639,7 +699,7 @@ class WireSelect(NumberSelect):
 
         if disabled:
             if draft.landing_type is None:
-                label = "Select Arrested landing first"
+                label = "Select landing type first"
             else:
                 label = "N/A - not required"
 
@@ -647,14 +707,14 @@ class WireSelect(NumberSelect):
                 discord.SelectOption(
                     label=label,
                     value="none",
-                    description="Wire is only used for Arrested landings.",
+                    description="Wire is only used for Arrested records.",
                     default=True,
                 )
             ]
         else:
             options = self.make_number_options(
                 selected=draft.wires,
-                start=1,
+                start=0,
                 end=4,
                 label_builder=lambda number: f"{number} wire",
             )
@@ -680,11 +740,11 @@ class WireSelect(NumberSelect):
 
 class BoltersSelect(NumberSelect):
     def __init__(self, draft: AttendDraft):
-        disabled = draft.landing_type != "Arrested"
+        disabled = draft.landing_type not in {"Arrested", "FTR"}
 
         if disabled:
             if draft.landing_type is None:
-                label = "Select Arrested landing first"
+                label = "Select Arrested or FTR first"
             else:
                 label = "N/A - not required"
 
@@ -692,7 +752,7 @@ class BoltersSelect(NumberSelect):
                 discord.SelectOption(
                     label=label,
                     value="none",
-                    description="Bolters are only used for Arrested landings.",
+                    description="Bolters are used for Arrested and FTR records.",
                     default=True,
                 )
             ]
@@ -760,8 +820,8 @@ class NextToPageThreeButton(discord.ui.Button):
 
         if not is_page_two_complete(self.view.draft):
             await interaction.response.send_message(
-                "Finish Combat Deaths and Landing Type first. "
-                "If Landing Type is Arrested, also select Wire and Bolters.",
+                "Finish Landing Type and every required field first. "
+                "Arrested requires Deaths, Wire, and Bolters; FTR requires Deaths and Bolters.",
                 ephemeral=True,
             )
             return
@@ -783,7 +843,11 @@ class AttendPageThreeView(AttendBaseView):
     def __init__(self, owner_id: int, timezone_name: str, draft: AttendDraft):
         super().__init__(owner_id, timezone_name, draft)
 
-        self.add_item(FlightLeadRatingSelect(draft))
+        clear_hidden_flight_lead_review(self.draft)
+
+        if flight_lead_review_allowed(draft):
+            self.add_item(FlightLeadRatingSelect(draft))
+
         self.add_item(RemarksButton(row=1))
         self.add_item(BackToPageTwoButton(row=2))
         self.add_item(CancelButton(row=2))
@@ -871,13 +935,15 @@ class RemarksModal(discord.ui.Modal):
             default=parent_view.draft.op_remarks or "",
         )
 
-        self.flight_lead_review = discord.ui.TextInput(
-            label="Flight lead review",
-            style=discord.TextStyle.paragraph,
-            required=False,
-            max_length=1000,
-            default=parent_view.draft.fl_remarks or "",
-        )
+        self.flight_lead_review = None
+        if flight_lead_review_allowed(parent_view.draft):
+            self.flight_lead_review = discord.ui.TextInput(
+                label="Flight lead review",
+                style=discord.TextStyle.paragraph,
+                required=False,
+                max_length=1000,
+                default=parent_view.draft.fl_remarks or "",
+            )
 
         self.notes = discord.ui.TextInput(
             label="Notes",
@@ -888,12 +954,17 @@ class RemarksModal(discord.ui.Modal):
         )
 
         self.add_item(self.op_review)
-        self.add_item(self.flight_lead_review)
+        if self.flight_lead_review is not None:
+            self.add_item(self.flight_lead_review)
         self.add_item(self.notes)
 
     async def on_submit(self, interaction: discord.Interaction):
         self.parent_view.draft.op_remarks = str(self.op_review.value or "").strip() or None
-        self.parent_view.draft.fl_remarks = str(self.flight_lead_review.value or "").strip() or None
+        if self.flight_lead_review is not None:
+            self.parent_view.draft.fl_remarks = str(self.flight_lead_review.value or "").strip() or None
+        else:
+            self.parent_view.draft.fl_remarks = None
+            self.parent_view.draft.flight_lead_rating = None
         self.parent_view.draft.note_remarks = str(self.notes.value or "").strip() or None
 
         await interaction.response.edit_message(
@@ -962,25 +1033,29 @@ class SubmitAttendanceButton(discord.ui.Button):
 
         if not is_page_two_complete(self.view.draft):
             await interaction.response.send_message(
-                "Go back and finish Combat Deaths and Landing Type first. "
-                "If Landing Type is Arrested, also select Wire and Bolters.",
+                "Go back and finish Landing Type and every required field first. "
+                "Arrested requires Deaths, Wire, and Bolters; FTR requires Deaths and Bolters.",
                 ephemeral=True,
             )
             return
 
-        if self.view.draft.landing_type == "Non-Pilot":
-            apply_nonpilot_rules(self.view.draft)
+        if self.view.draft.landing_type in {"Non-Pilot", "DNF"}:
+            apply_no_stat_rules(self.view.draft)
+        elif self.view.draft.landing_type == "FTR":
+            self.view.draft.wires = None
         elif self.view.draft.landing_type != "Arrested":
             self.view.draft.wires = None
             self.view.draft.bolters = None
 
+        clear_hidden_flight_lead_review(self.view.draft)
+
         if (
             self.view.draft.flight_lead_rating is not None
-            and self.view.draft.flight_lead_rating <= 2
+            and self.view.draft.flight_lead_rating < 4
             and not self.view.draft.fl_remarks
         ):
             await interaction.response.send_message(
-                "A 0-2 star flight lead rating requires a Flight lead review remark. "
+                "A flight lead rating below 4 stars requires a Flight lead review remark. "
                 "Press **Remarks** and fill in the Flight lead review box.",
                 ephemeral=True,
             )
@@ -1068,7 +1143,7 @@ def draft_from_existing(open_op, existing: dict) -> AttendDraft:
     draft.combat_deaths = int(combat_deaths) if combat_deaths is not None else None
     draft.landing_type = existing.get("landing_type") or None
 
-    if draft.landing_type == "Arrested":
+    if draft.landing_type in {"Arrested", "FTR"}:
         wires = existing.get("wires")
         bolters = existing.get("bolters")
         draft.wires = int(wires) if wires is not None else None

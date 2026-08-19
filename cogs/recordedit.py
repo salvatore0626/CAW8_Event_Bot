@@ -64,9 +64,10 @@ ANSI_BLUE = "\u001b[34m"
 
 LANDING_TYPES = [
     "Arrested",
-    "Vertical",
     "Airfield",
+    "Vertical",
     "Non-Pilot",
+    "FTR",
     "DNF",
 ]
 
@@ -171,8 +172,8 @@ def safe_text(value, fallback: str = "—") -> str:
 
 
 
-def apply_nonpilot_rules(draft: EditDraft) -> None:
-    if draft.landing_type == "Non-Pilot":
+def apply_no_stat_rules(draft: EditDraft) -> None:
+    if draft.landing_type in {"Non-Pilot", "DNF"}:
         draft.combat_deaths = 0
         draft.wires = None
         draft.bolters = None
@@ -916,10 +917,10 @@ class RecordEditEditPageTwo(discord.ui.View):
         self.event_id = event_id
         self.selected_index = selected_index
         self.draft = draft
-        apply_nonpilot_rules(self.draft)
+        apply_no_stat_rules(self.draft)
 
-        self.add_item(EditCombatDeathsSelect(draft))
         self.add_item(EditLandingTypeSelect(draft))
+        self.add_item(EditCombatDeathsSelect(draft))
         self.add_item(EditWireSelect(draft))
         self.add_item(EditBoltersSelect(draft))
         self.add_item(EditCancelButton(draft, row=4))
@@ -974,18 +975,22 @@ class NumberSelect(discord.ui.Select):
 
 class EditCombatDeathsSelect(NumberSelect):
     def __init__(self, draft: EditDraft):
-        locked = draft.landing_type == "Non-Pilot"
+        unavailable = draft.landing_type is None
+        locked = draft.landing_type in {"Non-Pilot", "DNF"}
 
-        if locked:
+        if unavailable:
+            options = [discord.SelectOption(label="Select landing type first", value="none", default=True)]
+            placeholder = "Select landing type first"
+        elif locked:
             options = [
                 discord.SelectOption(
                     label="Combat Deaths: 0",
                     value="0",
-                    description="Locked to 0 for Non-Pilot attendance.",
+                    description="Locked to 0 for Non-Pilot or DNF attendance.",
                     default=True,
                 )
             ]
-            placeholder = "Combat deaths locked to 0"
+            placeholder = "Combat deaths not applicable"
         else:
             options = self.make_options(
                 draft.combat_deaths,
@@ -1000,14 +1005,17 @@ class EditCombatDeathsSelect(NumberSelect):
             min_values=1,
             max_values=1,
             options=options,
-            disabled=locked,
-            row=0,
+            disabled=unavailable or locked,
+            row=1,
         )
 
     async def callback(self, interaction: discord.Interaction):
         assert isinstance(self.view, RecordEditEditPageTwo)
 
-        if self.view.draft.landing_type == "Non-Pilot":
+        if self.values[0] == "none":
+            return
+
+        if self.view.draft.landing_type in {"Non-Pilot", "DNF"}:
             self.view.draft.combat_deaths = 0
             await self.view.refresh(interaction)
             return
@@ -1033,7 +1041,7 @@ class EditLandingTypeSelect(discord.ui.Select):
             min_values=1,
             max_values=1,
             options=options,
-            row=1,
+            row=0,
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -1041,16 +1049,21 @@ class EditLandingTypeSelect(discord.ui.Select):
         previous_landing_type = self.view.draft.landing_type
         self.view.draft.landing_type = self.values[0]
 
-        if self.view.draft.landing_type == "Non-Pilot":
-            apply_nonpilot_rules(self.view.draft)
-        elif previous_landing_type == "Non-Pilot":
+        if self.view.draft.landing_type in {"Non-Pilot", "DNF"}:
+            apply_no_stat_rules(self.view.draft)
+        elif previous_landing_type in {"Non-Pilot", "DNF"}:
             self.view.draft.combat_deaths = None
             self.view.draft.wires = None
             self.view.draft.bolters = None
-        elif self.view.draft.landing_type != "Arrested":
+        elif self.view.draft.landing_type == "FTR":
             self.view.draft.wires = None
-            self.view.draft.bolters = None
-        elif previous_landing_type != "Arrested":
+            if previous_landing_type not in {"Arrested", "FTR"}:
+                self.view.draft.bolters = None
+        elif self.view.draft.landing_type == "Arrested":
+            if previous_landing_type != "Arrested":
+                self.view.draft.wires = None
+                self.view.draft.bolters = None
+        else:
             self.view.draft.wires = None
             self.view.draft.bolters = None
 
@@ -1073,7 +1086,7 @@ class EditWireSelect(NumberSelect):
         else:
             options = self.make_options(
                 draft.wires,
-                1,
+                0,
                 4,
                 label_builder=lambda number: f"{number} Wire",
             )
@@ -1098,7 +1111,7 @@ class EditWireSelect(NumberSelect):
 
 class EditBoltersSelect(NumberSelect):
     def __init__(self, draft: EditDraft):
-        disabled = draft.landing_type != "Arrested"
+        disabled = draft.landing_type not in {"Arrested", "FTR"}
 
         if disabled:
             options = [
@@ -1203,8 +1216,10 @@ class EditSaveButton(discord.ui.Button):
 
         await interaction.response.defer()
 
-        if self.view.draft.landing_type == "Non-Pilot":
-            apply_nonpilot_rules(self.view.draft)
+        if self.view.draft.landing_type in {"Non-Pilot", "DNF"}:
+            apply_no_stat_rules(self.view.draft)
+        elif self.view.draft.landing_type == "FTR":
+            self.view.draft.wires = None
         elif self.view.draft.landing_type != "Arrested":
             self.view.draft.wires = None
             self.view.draft.bolters = None
@@ -1315,15 +1330,20 @@ def required_save_errors(draft: EditDraft) -> list[str]:
     if draft.combat_deaths is None:
         errors.append("Combat deaths is required.")
 
-    if not draft.landing_type:
+    if draft.landing_type is None:
         errors.append("Landing type is required.")
 
     if draft.landing_type == "Arrested":
         if draft.wires is None:
-            errors.append("Wire is required for Arrested landings.")
-
+            errors.append("Wire is required for Arrested records.")
         if draft.bolters is None:
-            errors.append("Bolters is required for Arrested landings.")
+            errors.append("Bolters is required for Arrested records.")
+
+    if draft.landing_type == "FTR":
+        if draft.wires is not None:
+            errors.append("FTR records must use N/A for wire.")
+        if draft.bolters is None:
+            errors.append("Bolters is required for FTR records.")
 
     return errors
 

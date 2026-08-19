@@ -20,6 +20,7 @@ from services.after_action_report_service import (
 from services.permission_service import (
     require_mission_qualified_command,
 )
+from services.user_settings_service import get_user_settings, safe_timezone_name
 
 
 MAX_SELECT_OPTIONS = 25
@@ -44,7 +45,7 @@ def landing_summary(row: AfterActionAttendance) -> str:
     landing = row.landing_type or row.attend_type or row.status or "Unknown"
     parts: list[str] = [landing]
 
-    if landing.lower() == "arrested" and row.wires:
+    if landing.lower() in {"arrested", "ftr"} and row.wires is not None:
         parts.append(f"{row.wires} Wire")
 
     if row.bolters > 0:
@@ -119,7 +120,10 @@ def awards_code(report: AfterActionReport) -> str:
     return "\n".join(lines)
 
 
-def report_embed(report: AfterActionReport) -> discord.Embed:
+def report_embed(
+    report: AfterActionReport,
+    timezone_name: str = "America/Chicago",
+) -> discord.Embed:
     event = report.event
 
     gpa = "N/A"
@@ -130,17 +134,26 @@ def report_embed(report: AfterActionReport) -> discord.Embed:
         title="After Action Report",
         description=(
             f"**OP {event.event_id} - {event.op_name}**\n"
-            f"**Date:** {format_event_datetime(event.scheduled_at)} / {relative_time(event.scheduled_at)}\n\n"
+            f"**Date:** {format_event_datetime(event.scheduled_at, timezone_name)} / {relative_time(event.scheduled_at)}\n\n"
             f"{codeblock(attendance_code(report))}\n"
             f"**Operation GPA:** {gpa}\n\n"
             f"**Awards:**\n{codeblock(awards_code(report))}"
         ),
     )
 
+    embed.set_footer(
+        text=f'Timezone: {timezone_name} || Use "/user settings" to change timezone'
+    )
+
     return embed
 
 
-def selection_embed(events: list[AfterActionEvent], *, op_name: str | None = None) -> discord.Embed:
+def selection_embed(
+    events: list[AfterActionEvent],
+    *,
+    op_name: str | None = None,
+    timezone_name: str = "America/Chicago",
+) -> discord.Embed:
     if op_name:
         description = f"Latest completed ops matching **{op_name}**."
     else:
@@ -150,20 +163,28 @@ def selection_embed(events: list[AfterActionEvent], *, op_name: str | None = Non
         lines = []
         for event in events[:25]:
             lines.append(
-                f"OP {event.event_id:<5} {format_event_select_datetime(event.scheduled_at):<20} {event.op_name}"
+                f"OP {event.event_id:<5} {format_event_select_datetime(event.scheduled_at, timezone_name):<20} {event.op_name}"
             )
 
         # Keep this in the embed description, not a field, because fields max at 1024 chars.
         description += "\n\n" + codeblock("\n".join(lines))[:3900]
 
-    return discord.Embed(
+    embed = discord.Embed(
         title="Select After Action Report",
         description=description[:4096],
     )
+    embed.set_footer(
+        text=f'Timezone: {timezone_name} || Use "/user settings" to change timezone'
+    )
+    return embed
 
 
 class EventSelect(discord.ui.Select):
-    def __init__(self, events: list[AfterActionEvent]):
+    def __init__(
+        self,
+        events: list[AfterActionEvent],
+        timezone_name: str = "America/Chicago",
+    ):
         options = []
 
         for event in events[:MAX_SELECT_OPTIONS]:
@@ -172,7 +193,7 @@ class EventSelect(discord.ui.Select):
                     label=truncate(f"OP {event.event_id} - {event.op_name}", 100),
                     value=str(event.event_id),
                     description=truncate(
-                        f"{format_event_select_datetime(event.scheduled_at)} / {relative_time(event.scheduled_at)}",
+                        f"{format_event_select_datetime(event.scheduled_at, timezone_name)} / {relative_time(event.scheduled_at)}",
                         100,
                     ),
                 )
@@ -203,11 +224,12 @@ class EventSelect(discord.ui.Select):
                 return
 
             await interaction.edit_original_response(
-                embed=report_embed(report),
+                embed=report_embed(report, self.view.timezone_name),
                 view=AfterActionReportView(
                     owner_id=self.view.owner_id,
                     events=self.view.events,
                     selected_index=selected_index,
+                    timezone_name=self.view.timezone_name,
                 ),
             )
         except Exception as error:
@@ -223,12 +245,14 @@ class AfterActionSelectView(discord.ui.View):
         self,
         owner_id: int,
         events: list[AfterActionEvent],
+        timezone_name: str = "America/Chicago",
     ):
         super().__init__(timeout=900)
         self.owner_id = int(owner_id)
         self.events = events
+        self.timezone_name = safe_timezone_name(timezone_name)
 
-        self.add_item(EventSelect(events))
+        self.add_item(EventSelect(events, self.timezone_name))
         self.add_item(QuitButton(row=1))
 
     def index_for_event_id(self, event_id: int) -> int:
@@ -260,7 +284,7 @@ class PrevReportButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         assert isinstance(self.view, AfterActionReportView)
-        await self.view.move(interaction, -1)
+        await self.view.move_by_event_id(interaction, direction=-1)
 
 
 class NextReportButton(discord.ui.Button):
@@ -274,7 +298,7 @@ class NextReportButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         assert isinstance(self.view, AfterActionReportView)
-        await self.view.move(interaction, 1)
+        await self.view.move_by_event_id(interaction, direction=1)
 
 
 class QuitButton(discord.ui.Button):
@@ -306,11 +330,13 @@ class AfterActionReportView(discord.ui.View):
         owner_id: int,
         events: list[AfterActionEvent],
         selected_index: int,
+        timezone_name: str = "America/Chicago",
     ):
         super().__init__(timeout=900)
         self.owner_id = int(owner_id)
         self.events = events
         self.selected_index = selected_index
+        self.timezone_name = safe_timezone_name(timezone_name)
 
         disabled = len(events) <= 1
 
@@ -328,7 +354,18 @@ class AfterActionReportView(discord.ui.View):
 
         return True
 
-    async def move(self, interaction: discord.Interaction, delta: int):
+    async def move_by_event_id(
+        self,
+        interaction: discord.Interaction,
+        *,
+        direction: int,
+    ):
+        """Move by operation ID, independent of the list's date sort order.
+
+        direction < 0 selects the closest lower event ID (Prev).
+        direction > 0 selects the closest higher event ID (Next).
+        Navigation wraps at the lowest/highest ID to preserve the existing UI behavior.
+        """
         await interaction.response.defer()
 
         try:
@@ -340,8 +377,43 @@ class AfterActionReportView(discord.ui.View):
                 )
                 return
 
-            self.selected_index = (self.selected_index + delta) % len(self.events)
-            event = self.events[self.selected_index]
+            current_event = self.events[self.selected_index]
+            current_id = int(current_event.event_id)
+
+            if direction < 0:
+                candidates = [
+                    (index, event)
+                    for index, event in enumerate(self.events)
+                    if int(event.event_id) < current_id
+                ]
+                if candidates:
+                    target_index, event = max(
+                        candidates,
+                        key=lambda item: int(item[1].event_id),
+                    )
+                else:
+                    target_index, event = max(
+                        enumerate(self.events),
+                        key=lambda item: int(item[1].event_id),
+                    )
+            else:
+                candidates = [
+                    (index, event)
+                    for index, event in enumerate(self.events)
+                    if int(event.event_id) > current_id
+                ]
+                if candidates:
+                    target_index, event = min(
+                        candidates,
+                        key=lambda item: int(item[1].event_id),
+                    )
+                else:
+                    target_index, event = min(
+                        enumerate(self.events),
+                        key=lambda item: int(item[1].event_id),
+                    )
+
+            self.selected_index = target_index
             report = get_after_action_report(event.event_id)
 
             if report is None:
@@ -352,11 +424,12 @@ class AfterActionReportView(discord.ui.View):
                 return
 
             await interaction.edit_original_response(
-                embed=report_embed(report),
+                embed=report_embed(report, self.timezone_name),
                 view=AfterActionReportView(
                     owner_id=self.owner_id,
                     events=self.events,
                     selected_index=self.selected_index,
+                    timezone_name=self.timezone_name,
                 ),
             )
         except Exception as error:
@@ -398,6 +471,11 @@ async def report(
     await interaction.response.defer(thinking=True, ephemeral=True)
 
     try:
+        timezone_name = "America/Chicago"
+        if isinstance(interaction.user, discord.Member):
+            settings = get_user_settings(interaction.user)
+            timezone_name = safe_timezone_name(settings.timezone)
+
         if opid is not None and opname:
             await interaction.followup.send(
                 "Use either `opid` or `opname`, not both.",
@@ -429,11 +507,12 @@ async def report(
                     break
 
             await interaction.followup.send(
-                embed=report_embed(report_data),
+                embed=report_embed(report_data, timezone_name),
                 view=AfterActionReportView(
                     owner_id=interaction.user.id,
                     events=events,
                     selected_index=selected_index,
+                    timezone_name=timezone_name,
                 ),
             )
             return
@@ -451,10 +530,15 @@ async def report(
             return
 
         await interaction.followup.send(
-            embed=selection_embed(events, op_name=opname),
+            embed=selection_embed(
+                events,
+                op_name=opname,
+                timezone_name=timezone_name,
+            ),
             view=AfterActionSelectView(
                 owner_id=interaction.user.id,
                 events=events,
+                timezone_name=timezone_name,
             ),
         )
     except Exception as error:

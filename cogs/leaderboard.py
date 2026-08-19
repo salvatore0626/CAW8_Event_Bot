@@ -325,7 +325,7 @@ def fetch_leaderboard_attendance_rows(
 
 
 def gpa_attempt_score(row: dict[str, Any]) -> tuple[int, float]:
-    if str(row.get("landing_type") or "") != "Arrested":
+    if str(row.get("landing_type") or "") not in {"Arrested", "FTR"}:
         return 0, 0.0
 
     attempts = 0

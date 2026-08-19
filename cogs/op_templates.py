@@ -4,7 +4,9 @@ import re
 import time
 import traceback
 import json
+from datetime import datetime
 from dataclasses import dataclass, field
+from zoneinfo import ZoneInfo
 from typing import Optional
 
 import discord
@@ -38,6 +40,16 @@ try:
 except ImportError:
     MISSION_EXECUTER_ROLES = []
 
+try:
+    from config import OP_TEMPLATE_REMARKS_PER_PAGE
+except ImportError:
+    OP_TEMPLATE_REMARKS_PER_PAGE = 3
+
+try:
+    from config import SCHEDULE_DEFAULT_TIMEZONE
+except ImportError:
+    SCHEDULE_DEFAULT_TIMEZONE = "America/Chicago"
+
 from services.op_template_service import (
     FlightTemplateDraft,
     OpTemplateEditDraft,
@@ -46,7 +58,9 @@ from services.op_template_service import (
     creator_display_name,
     get_active_airframes,
     list_op_templates,
+    list_template_remarks,
     load_edit_draft,
+    search_op_template_choices,
     normalize_flight_name,
     normalize_op_name,
     player_slot_values_for_flight,
@@ -1454,6 +1468,16 @@ async def has_template_permission(interaction: discord.Interaction) -> bool:
 class TemplateListState:
     owner_id: int
     selected_index: int = 0
+    sort_order: str = "id"
+
+
+SORT_LABELS = {
+    "id": "ID",
+    "runs": "Run count",
+    "players": "Players",
+    "flights": "Flights",
+    "gpa": "GPA average",
+}
 
 
 def edit_draft_signature(draft: OpTemplateEditDraft) -> str:
@@ -1488,6 +1512,7 @@ class TemplateEditState:
     owner_id: int
     list_selected_index: int
     draft: OpTemplateEditDraft
+    list_sort_order: str = "id"
     original_signature: str | None = None
 
     def __post_init__(self):
@@ -1496,6 +1521,94 @@ class TemplateEditState:
 
     def has_changes(self) -> bool:
         return edit_draft_signature(self.draft) != self.original_signature
+
+
+@dataclass
+class TemplateRemarksState:
+    owner_id: int
+    template_id: int
+    template_name: str
+    list_selected_index: int
+    list_sort_order: str = "id"
+    page_index: int = 0
+
+
+def sorted_template_rows(state: TemplateListState):
+    rows = list_op_templates()
+    sort_order = state.sort_order if state.sort_order in SORT_LABELS else "id"
+    state.sort_order = sort_order
+
+    if sort_order == "runs":
+        return sorted(rows, key=lambda row: (row.runtime_count, row.id), reverse=True)
+    if sort_order == "players":
+        return sorted(rows, key=lambda row: (row.total_players, row.id), reverse=True)
+    if sort_order == "flights":
+        return sorted(rows, key=lambda row: (row.flight_count, row.id), reverse=True)
+    if sort_order == "gpa":
+        return sorted(
+            rows,
+            key=lambda row: (
+                row.gpa_average is not None,
+                row.gpa_average if row.gpa_average is not None else -1.0,
+                row.id,
+            ),
+            reverse=True,
+        )
+
+    return sorted(rows, key=lambda row: row.id, reverse=True)
+
+
+def selected_template_row(state: TemplateListState):
+    rows = sorted_template_rows(state)
+    if not rows:
+        state.selected_index = 0
+        return None
+
+    state.selected_index = max(0, min(state.selected_index, len(rows) - 1))
+    return rows[state.selected_index]
+
+
+def select_template_id(state: TemplateListState, template_id: int) -> bool:
+    rows = sorted_template_rows(state)
+    for index, row in enumerate(rows):
+        if row.id == int(template_id):
+            state.selected_index = index
+            return True
+    return False
+
+
+def resolve_starting_template_id(value: str | None) -> int | None:
+    wanted = clean_text(value)
+    if not wanted:
+        return None
+
+    rows = list_op_templates()
+
+    try:
+        template_id = int(wanted)
+    except (TypeError, ValueError):
+        template_id = None
+
+    if template_id is not None and any(row.id == template_id for row in rows):
+        return template_id
+
+    folded = wanted.casefold()
+    for row in rows:
+        if row.name.casefold() == folded:
+            return row.id
+
+    return None
+
+
+async def op_template_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    del interaction
+    return [
+        app_commands.Choice(name=name[:100], value=str(template_id))
+        for template_id, name in search_op_template_choices(current, limit=25)
+    ]
 
 
 def selected_window(total: int, selected_index: int) -> tuple[int, int]:
@@ -1519,6 +1632,7 @@ def color_line(text: str, color: str | None = None) -> str:
 
 def table_line_for_template(row, *, selected: bool, color: str | None) -> str:
     marker = ">" if selected else " "
+    gpa = f"{row.gpa_average:.2f}" if row.gpa_average is not None else "—"
 
     return color_line(
         (
@@ -1526,7 +1640,8 @@ def table_line_for_template(row, *, selected: bool, color: str | None) -> str:
             f"{row.name:<20.20} "
             f"{row.total_players:<7} "
             f"{row.flight_count:<8} "
-            f"{row.runtime_count}"
+            f"{row.runtime_count:<5} "
+            f"{gpa:>4}"
         ),
         color,
     )
@@ -1545,7 +1660,7 @@ def event_ids_text(event_ids: list[int]) -> str:
 
 
 def build_templates_embed(state: TemplateListState) -> discord.Embed:
-    rows = list_op_templates()
+    rows = sorted_template_rows(state)
     total = len(rows)
 
     if total:
@@ -1559,7 +1674,7 @@ def build_templates_embed(state: TemplateListState) -> discord.Embed:
     if not rows:
         lines.append("No op templates found.")
     else:
-        lines.append("ID   Name                 Players  Flights   Runs")
+        lines.append("ID   Name                 Players  Flights   Runs  GPA")
 
         for idx in range(start, end):
             row = rows[idx]
@@ -1580,6 +1695,7 @@ def build_templates_embed(state: TemplateListState) -> discord.Embed:
     if rows:
         row = rows[state.selected_index]
         creator = row.creator_display_name or row.creator or "Not set"
+        gpa = f"{row.gpa_average:.2f}" if row.gpa_average is not None else "—"
 
         embed.add_field(
             name="Op Details",
@@ -1588,32 +1704,163 @@ def build_templates_embed(state: TemplateListState) -> discord.Embed:
                 f"**Type:** `{row.op_type}`  **Players:** `{row.total_players}`  "
                 f"**Flights:** `{row.flight_count}`\n"
                 f"**Creator:** `{creator}`\n"
-                f"**Runtimes:** `{row.runtime_count}`\n"
+                f"**Runtimes:** `{row.runtime_count}`  **GPA Average:** `{gpa}`  "
+                f"**Remarks:** `{row.remarks_count}`\n"
                 f"**Event IDs:** {event_ids_text(row.completed_event_ids)}"
             )[:1000],
             inline=False,
         )
 
-    embed.set_footer(text="Blue templates have already been scheduled/run at least once.")
+    sort_label = SORT_LABELS.get(state.sort_order, SORT_LABELS["id"])
+    embed.set_footer(
+        text=f"Sorted by {sort_label}. Blue templates have already been scheduled/run at least once."
+    )
 
     return embed
 
 
-def template_rows_count() -> int:
-    return len(list_op_templates())
+def remarks_per_page() -> int:
+    try:
+        configured = int(OP_TEMPLATE_REMARKS_PER_PAGE)
+    except (TypeError, ValueError):
+        configured = 3
+
+    # Discord embeds have a 6,000-character aggregate limit. Each op remark can
+    # be 1,000 characters, so keep one page to at most five full remarks.
+    return max(1, min(5, configured))
+
+
+def format_remark_date(timestamp: int | None) -> str:
+    if not timestamp:
+        return "Unknown Date"
+
+    try:
+        tz = ZoneInfo(str(SCHEDULE_DEFAULT_TIMEZONE or "America/Chicago"))
+    except Exception:
+        tz = ZoneInfo("America/Chicago")
+
+    try:
+        return datetime.fromtimestamp(int(timestamp), tz=tz).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return "Unknown Date"
+
+
+def remark_code_block(text: str) -> str:
+    safe = str(text or "").replace("```", "''' ").strip()
+    if len(safe) > 990:
+        safe = safe[:987].rstrip() + "..."
+    return f"```\n{safe}\n```"
+
+
+def build_template_remarks_embed(state: TemplateRemarksState) -> discord.Embed:
+    remarks = list_template_remarks(state.template_name)
+    per_page = remarks_per_page()
+    page_count = max(1, (len(remarks) + per_page - 1) // per_page)
+    state.page_index = max(0, min(state.page_index, page_count - 1))
+
+    start = state.page_index * per_page
+    shown = remarks[start : start + per_page]
+
+    embed = discord.Embed(title=f"{state.template_name} Remarks")
+
+    if not shown:
+        embed.description = "No written operation remarks were found for this template."
+    else:
+        for remark in shown:
+            date = format_remark_date(remark.timestamp)
+            user_name = remark.user_name[:180]
+            embed.add_field(
+                name=f"{date} / {user_name}",
+                value=remark_code_block(remark.remarks),
+                inline=False,
+            )
+
+    embed.set_footer(
+        text=(
+            f"Page {state.page_index + 1}/{page_count} • "
+            f"{len(remarks)} written remark{'s' if len(remarks) != 1 else ''}"
+        )
+    )
+    return embed
+
+
+class TemplateSortSelect(discord.ui.Select):
+    def __init__(self, state: TemplateListState, row: int):
+        options = [
+            discord.SelectOption(
+                label=label,
+                value=value,
+                default=state.sort_order == value,
+            )
+            for value, label in SORT_LABELS.items()
+        ]
+
+        super().__init__(
+            placeholder="Sort templates",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=row,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        assert isinstance(self.view, TemplateListView)
+        current = selected_template_row(self.view.state)
+        current_id = current.id if current is not None else None
+
+        self.view.state.sort_order = self.values[0]
+        if current_id is not None:
+            select_template_id(self.view.state, current_id)
+        else:
+            self.view.state.selected_index = 0
+
+        await self.view.refresh(interaction)
 
 
 class TemplateListView(discord.ui.View):
     def __init__(self, state: TemplateListState):
         super().__init__(timeout=600)
         self.state = state
-        count = template_rows_count()
+        rows = sorted_template_rows(state)
+        count = len(rows)
+        if count:
+            state.selected_index = max(0, min(state.selected_index, count - 1))
+            selected = rows[state.selected_index]
+        else:
+            state.selected_index = 0
+            selected = None
 
-        self.add_item(TemplatePrevButton(disabled=state.selected_index <= 0, row=0))
-        self.add_item(TemplateCancelButton(row=0))
-        self.add_item(TemplateCreateButton(row=0))
-        self.add_item(TemplateEditButton(disabled=count <= 0, row=0))
-        self.add_item(TemplateNextButton(disabled=count <= 0 or state.selected_index >= count - 1, row=0))
+        self.add_item(TemplateSortSelect(state, row=0))
+
+        self.add_item(
+            TemplateRemarksButton(
+                disabled=selected is None or selected.remarks_count <= 0,
+                row=1,
+            )
+        )
+        self.add_item(TemplateEditButton(disabled=count <= 0, row=1))
+        self.add_item(TemplateCreateButton(row=1))
+
+        self.add_item(TemplatePrevButton(disabled=count <= 0, row=2))
+        self.add_item(
+            TemplatePageDownButton(
+                disabled=count <= 0 or state.selected_index >= count - 1,
+                row=2,
+            )
+        )
+        self.add_item(TemplateCancelButton(row=2))
+        self.add_item(
+            TemplatePageUpButton(
+                disabled=count <= 0 or state.selected_index <= 0,
+                row=2,
+            )
+        )
+        self.add_item(
+            TemplateNextButton(
+                disabled=count <= 0 or state.selected_index >= count - 1,
+                row=2,
+            )
+        )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.state.owner_id:
@@ -1638,7 +1885,52 @@ class TemplatePrevButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         assert isinstance(self.view, TemplateListView)
-        self.view.state.selected_index = max(0, self.view.state.selected_index - 1)
+        count = len(sorted_template_rows(self.view.state))
+        if count <= 0:
+            await interaction.response.defer()
+            return
+
+        if self.view.state.selected_index <= 0:
+            self.view.state.selected_index = count - 1
+        else:
+            self.view.state.selected_index -= 1
+
+        await self.view.refresh(interaction)
+
+
+class TemplatePageDownButton(discord.ui.Button):
+    def __init__(self, disabled: bool, row: int):
+        super().__init__(label="Pg Down", style=discord.ButtonStyle.secondary, disabled=disabled, row=row)
+
+    async def callback(self, interaction: discord.Interaction):
+        assert isinstance(self.view, TemplateListView)
+        count = len(sorted_template_rows(self.view.state))
+        if count <= 0:
+            await interaction.response.defer()
+            return
+
+        self.view.state.selected_index = min(
+            count - 1,
+            self.view.state.selected_index + WINDOW_SIZE,
+        )
+        await self.view.refresh(interaction)
+
+
+class TemplatePageUpButton(discord.ui.Button):
+    def __init__(self, disabled: bool, row: int):
+        super().__init__(label="Pg Up", style=discord.ButtonStyle.secondary, disabled=disabled, row=row)
+
+    async def callback(self, interaction: discord.Interaction):
+        assert isinstance(self.view, TemplateListView)
+        count = len(sorted_template_rows(self.view.state))
+        if count <= 0:
+            await interaction.response.defer()
+            return
+
+        self.view.state.selected_index = max(
+            0,
+            self.view.state.selected_index - WINDOW_SIZE,
+        )
         await self.view.refresh(interaction)
 
 
@@ -1648,14 +1940,17 @@ class TemplateNextButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         assert isinstance(self.view, TemplateListView)
-        count = template_rows_count()
-        self.view.state.selected_index = min(max(0, count - 1), self.view.state.selected_index + 1)
+        count = len(sorted_template_rows(self.view.state))
+        self.view.state.selected_index = min(
+            max(0, count - 1),
+            self.view.state.selected_index + 1,
+        )
         await self.view.refresh(interaction)
 
 
 class TemplateCancelButton(discord.ui.Button):
     def __init__(self, row: int):
-        super().__init__(label="Exit", style=discord.ButtonStyle.secondary, row=row)
+        super().__init__(label="Quit", style=discord.ButtonStyle.secondary, row=row)
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.edit_message(
@@ -1680,6 +1975,125 @@ class TemplateCreateButton(discord.ui.Button):
         )
 
 
+class TemplateRemarksButton(discord.ui.Button):
+    def __init__(self, disabled: bool, row: int):
+        super().__init__(
+            label="Remarks",
+            style=discord.ButtonStyle.secondary,
+            disabled=disabled,
+            row=row,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        assert isinstance(self.view, TemplateListView)
+        row = selected_template_row(self.view.state)
+        if row is None or row.remarks_count <= 0:
+            await interaction.response.send_message(
+                "That template has no written operation remarks.",
+                ephemeral=True,
+            )
+            return
+
+        state = TemplateRemarksState(
+            owner_id=self.view.state.owner_id,
+            template_id=row.id,
+            template_name=row.name,
+            list_selected_index=self.view.state.selected_index,
+            list_sort_order=self.view.state.sort_order,
+        )
+        await interaction.response.edit_message(
+            embed=build_template_remarks_embed(state),
+            view=TemplateRemarksView(state),
+        )
+
+
+class TemplateRemarksView(discord.ui.View):
+    def __init__(self, state: TemplateRemarksState):
+        super().__init__(timeout=600)
+        self.state = state
+        remarks = list_template_remarks(state.template_name)
+        per_page = remarks_per_page()
+        page_count = max(1, (len(remarks) + per_page - 1) // per_page)
+        state.page_index = max(0, min(state.page_index, page_count - 1))
+
+        self.add_item(
+            TemplateRemarkPrevButton(
+                disabled=state.page_index <= 0,
+                row=0,
+            )
+        )
+        self.add_item(TemplateRemarksBackButton(row=0))
+        self.add_item(
+            TemplateRemarkNextButton(
+                disabled=state.page_index >= page_count - 1,
+                row=0,
+            )
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.state.owner_id:
+            await interaction.response.send_message(
+                "This op template view belongs to someone else.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def refresh(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            embed=build_template_remarks_embed(self.state),
+            view=TemplateRemarksView(self.state),
+        )
+
+
+class TemplateRemarkPrevButton(discord.ui.Button):
+    def __init__(self, disabled: bool, row: int):
+        super().__init__(
+            label="Prev",
+            style=discord.ButtonStyle.secondary,
+            disabled=disabled,
+            row=row,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        assert isinstance(self.view, TemplateRemarksView)
+        self.view.state.page_index = max(0, self.view.state.page_index - 1)
+        await self.view.refresh(interaction)
+
+
+class TemplateRemarksBackButton(discord.ui.Button):
+    def __init__(self, row: int):
+        super().__init__(label="Op Templates", style=discord.ButtonStyle.primary, row=row)
+
+    async def callback(self, interaction: discord.Interaction):
+        assert isinstance(self.view, TemplateRemarksView)
+        state = TemplateListState(
+            owner_id=self.view.state.owner_id,
+            selected_index=self.view.state.list_selected_index,
+            sort_order=self.view.state.list_sort_order,
+        )
+        select_template_id(state, self.view.state.template_id)
+        await interaction.response.edit_message(
+            embed=build_templates_embed(state),
+            view=TemplateListView(state),
+        )
+
+
+class TemplateRemarkNextButton(discord.ui.Button):
+    def __init__(self, disabled: bool, row: int):
+        super().__init__(
+            label="Next",
+            style=discord.ButtonStyle.secondary,
+            disabled=disabled,
+            row=row,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        assert isinstance(self.view, TemplateRemarksView)
+        self.view.state.page_index += 1
+        await self.view.refresh(interaction)
+
+
 class TemplateEditButton(discord.ui.Button):
     def __init__(self, disabled: bool, row: int):
         super().__init__(label="Edit", style=discord.ButtonStyle.primary, disabled=disabled, row=row)
@@ -1687,13 +2101,11 @@ class TemplateEditButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         assert isinstance(self.view, TemplateListView)
 
-        rows = list_op_templates()
-
-        if not rows:
+        row = selected_template_row(self.view.state)
+        if row is None:
             await interaction.response.send_message("No templates exist to edit.", ephemeral=True)
             return
 
-        row = rows[self.view.state.selected_index]
         draft = load_edit_draft(row.id)
 
         if draft is None:
@@ -1703,6 +2115,7 @@ class TemplateEditButton(discord.ui.Button):
         state = TemplateEditState(
             owner_id=self.view.state.owner_id,
             list_selected_index=self.view.state.selected_index,
+            list_sort_order=self.view.state.sort_order,
             draft=draft,
         )
 
@@ -1710,7 +2123,6 @@ class TemplateEditButton(discord.ui.Button):
             embed=build_edit_op_info_embed(state),
             view=TemplateEditOpInfoView(state),
         )
-
 
 def ansi_status(label: str, value, *, locked: bool = False, valid: bool = True) -> str:
     shown = value if value not in (None, "") else "Not set"
@@ -1925,7 +2337,12 @@ class EditCancelButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         assert isinstance(self.view, BaseTemplateEditView)
-        state = TemplateListState(owner_id=self.view.state.owner_id, selected_index=self.view.state.list_selected_index)
+        state = TemplateListState(
+            owner_id=self.view.state.owner_id,
+            selected_index=self.view.state.list_selected_index,
+            sort_order=self.view.state.list_sort_order,
+        )
+        select_template_id(state, self.view.state.draft.id)
 
         await interaction.response.edit_message(
             embed=build_templates_embed(state),
@@ -2045,7 +2462,12 @@ class EditSaveButton(discord.ui.Button):
             await interaction.response.send_message(f"Could not save template: `{error}`", ephemeral=True)
             return
 
-        state = TemplateListState(owner_id=self.view.state.owner_id, selected_index=self.view.state.list_selected_index)
+        state = TemplateListState(
+            owner_id=self.view.state.owner_id,
+            selected_index=self.view.state.list_selected_index,
+            sort_order=self.view.state.list_sort_order,
+        )
+        select_template_id(state, self.view.state.draft.id)
 
         await interaction.response.edit_message(
             embed=build_templates_embed(state),
@@ -2464,7 +2886,15 @@ class OpTemplatesCog(commands.Cog):
         name="templates",
         description="Browse, create, and edit operation templates.",
     )
-    async def templates(self, interaction: discord.Interaction):
+    @app_commands.describe(
+        template="Optional template to start on.",
+    )
+    @app_commands.autocomplete(template=op_template_autocomplete)
+    async def templates(
+        self,
+        interaction: discord.Interaction,
+        template: str | None = None,
+    ):
         if not await require_mission_executer_command(interaction):
             return
         if not await has_template_permission(interaction):
@@ -2472,6 +2902,9 @@ class OpTemplatesCog(commands.Cog):
             return
 
         state = TemplateListState(owner_id=interaction.user.id)
+        starting_template_id = resolve_starting_template_id(template)
+        if starting_template_id is not None:
+            select_template_id(state, starting_template_id)
 
         await interaction.response.send_message(
             embed=build_templates_embed(state),

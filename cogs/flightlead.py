@@ -51,6 +51,7 @@ ANSI_RESET = "\u001b[0m"
 ANSI_GREEN = "\u001b[32m"
 ANSI_RED = "\u001b[31m"
 ANSI_YELLOW = "\u001b[33m"
+ANSI_BLUE = "\u001b[34m"
 ANSI_WHITE = "\u001b[37m"
 # Discord ANSI support is limited. This is the closest usable orange in an ansi block.
 ANSI_ORANGE = "\u001b[33m"
@@ -122,7 +123,7 @@ def build_event_list_block(
     timezone_name: str,
 ) -> str:
     if not events:
-        return "```ansi\nNo ops in the next 7 days.\n```"
+        return "```ansi\nNo scheduled ops available.\n```"
 
     lines = [
         event_line(event, timezone_name)
@@ -148,11 +149,23 @@ def slot_status_text(
     return slot.status.upper()
 
 
-def slot_color(slot: FlightLeadSlot) -> str:
+def slot_color(
+    slot: FlightLeadSlot,
+    user_id: int,
+) -> str:
+    # Blue = reserved by you.
+    if slot.is_reserved_by(str(user_id)):
+        return ANSI_BLUE
+
+    # Yellow = reserved/locked by someone else.
     if slot.is_taken:
+        return ANSI_YELLOW
+
+    # Green = available to reserve.
+    if slot.is_open:
         return ANSI_GREEN
 
-    return ANSI_ORANGE
+    return ANSI_WHITE
 
 
 def build_flight_list_block(
@@ -169,7 +182,7 @@ def build_flight_list_block(
         status = slot_status_text(slot, user_id)
         line = f"{slot.flight_letter} | {slot.flight_name} — {aircraft}: {status}"
 
-        lines.append(f"{slot_color(slot)}{line}{ANSI_RESET}")
+        lines.append(f"{slot_color(slot, user_id)}{line}{ANSI_RESET}")
 
     return "```ansi\n" + "\n".join(lines)[:3800] + "\n```"
 
@@ -309,7 +322,7 @@ class EventSelect(discord.ui.Select):
         else:
             options = [
                 discord.SelectOption(
-                    label="No ops in the next 7 days",
+                    label="No scheduled ops available",
                     value="0",
                     description="There is nothing to select right now.",
                 )
@@ -732,7 +745,7 @@ def build_event_page_embed(
     embed = discord.Embed(
         title="Flight Lead Reservations",
         description=(
-            "Select an op event from the next 7 days.\n\n"
+            "Select a scheduled op. Upcoming ops within 7 days and overdue scheduled ops are shown.\n\n"
             f"{build_event_list_block(events, timezone_name)}"
         ),
     )

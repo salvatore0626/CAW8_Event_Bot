@@ -36,6 +36,9 @@ try:
 except ImportError:
     SCHEDULE_EVENT_DURATION_HOURS = 3
 
+from services.situation_room_service import queue_situation_room_refresh_now
+
+
 from services.schedule_service import (
     OpTemplateSummary,
     build_day_choices,
@@ -504,6 +507,11 @@ class ConfirmDefaultScheduleButton(discord.ui.Button):
             )
             return
 
+        # The event rows and their open flight-lead reservation slots now exist.
+        # Reconcile once after the full series is committed so the Situation Room
+        # creates/reorders the reservation boards immediately.
+        queue_situation_room_refresh_now(interaction.client)
+
         await interaction.edit_original_response(
             content=None,
             embed=discord.Embed(
@@ -707,33 +715,33 @@ class ConfirmCustomScheduleButton(discord.ui.Button):
             )
             return
 
-        if timestamp <= now_ts():
-            await interaction.response.send_message(
-                "That time is in the past. Pick a future time.",
-                ephemeral=True,
-            )
-            return
+        is_past_time = timestamp <= now_ts()
 
         self.view.schedule_in_progress = True
         lock_schedule_view(self.view)
 
         await interaction.response.edit_message(
-            content="Creating scheduled event. Please wait...",
+            content="Scheduling operation. Please wait...",
             view=self.view,
         )
 
         server_event_id = None
 
         try:
-            server_event = await create_discord_server_event(
-                guild=interaction.guild,
-                template=self.view.draft.template,
-                scheduled_at=timestamp,
-                selected_channel_id=self.view.draft.selected_channel_id,
-                created_by=interaction.user,
-            )
+            # Backdated custom ops are used for same-day recovery when an op
+            # started while Airboss was unavailable. Discord scheduled events
+            # cannot be created with a start time that has already passed, so
+            # only create one when the selected timestamp is still in the future.
+            if not is_past_time:
+                server_event = await create_discord_server_event(
+                    guild=interaction.guild,
+                    template=self.view.draft.template,
+                    scheduled_at=timestamp,
+                    selected_channel_id=self.view.draft.selected_channel_id,
+                    created_by=interaction.user,
+                )
 
-            server_event_id = str(server_event.id)
+                server_event_id = str(server_event.id)
 
             event_id = create_op_event(
                 op_template_id=self.view.draft.template.id,
@@ -741,6 +749,7 @@ class ConfirmCustomScheduleButton(discord.ui.Button):
                 scheduled_by=str(interaction.user.id),
                 server_event_id=server_event_id,
                 schedule_series_id=None,
+                allow_past=is_past_time,
             )
         except Exception as error:
             await delete_discord_server_event(interaction.guild, server_event_id)
@@ -755,6 +764,10 @@ class ConfirmCustomScheduleButton(discord.ui.Button):
             )
             return
 
+        # Create the flight-lead reservation board as soon as the event and
+        # reservation rows have been committed.
+        queue_situation_room_refresh_now(interaction.client)
+
         await interaction.edit_original_response(
             content=None,
             embed=discord.Embed(
@@ -762,6 +775,11 @@ class ConfirmCustomScheduleButton(discord.ui.Button):
                 description=(
                     f"Created scheduled event `{event_id}` for **{self.view.draft.template.name}**.\n"
                     f"Time: {format_timestamp_local(timestamp, self.view.draft.timezone_name)}"
+                    + (
+                        "\nDiscord Scheduled Event: Not created because the selected time has already passed."
+                        if is_past_time
+                        else ""
+                    )
                 ),
             ),
             view=None,

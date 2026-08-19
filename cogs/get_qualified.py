@@ -30,6 +30,8 @@ from services.get_qualified_service import (
     get_existing_pending_or_mia_request,
     update_existing_request_availability,
 )
+from services.user_settings_service import timezone_select_options, safe_zoneinfo
+from services.admin_log_service import log_admin_action
 from services.ping_cooldown_service import (
     check_ping_cooldown,
     format_cooldown,
@@ -183,15 +185,7 @@ def is_within_notification_window(
     notify_start: str | None,
     notify_end: str | None,
 ) -> bool:
-    if not timezone:
-        return False
-
-    try:
-        local_now = datetime.now(ZoneInfo(str(timezone)))
-    except ZoneInfoNotFoundError:
-        return False
-    except Exception:
-        return False
+    local_now = datetime.now(safe_zoneinfo(timezone))
 
     now_minutes = local_now.hour * 60 + local_now.minute
     start_minutes = parse_notification_time(notify_start, "09:00")
@@ -651,6 +645,13 @@ class CancelSubmittedRequestButton(discord.ui.Button):
             request_id=self.existing_request.id,
             discord_id=str(interaction.user.id),
         )
+        log_admin_action(
+            action="request_cancelled",
+            user_discord_id=interaction.user.id,
+            performed_by_id=interaction.user.id,
+            before_json={"request_id": self.existing_request.id, "status": self.existing_request.status},
+            after_json={"request_id": self.existing_request.id, "status": "cancelled"},
+        )
 
         await interaction.response.edit_message(
             content=CANCELLED_REQUEST_MESSAGE,
@@ -770,6 +771,13 @@ class CancelExistingRequestButton(discord.ui.Button):
             request_id=self.existing_request.id,
             discord_id=str(interaction.user.id),
         )
+        log_admin_action(
+            action="request_cancelled",
+            user_discord_id=interaction.user.id,
+            performed_by_id=interaction.user.id,
+            before_json={"request_id": self.existing_request.id, "status": self.existing_request.status},
+            after_json={"request_id": self.existing_request.id, "status": "cancelled"},
+        )
 
         await interaction.response.edit_message(
             content=CANCELLED_REQUEST_MESSAGE,
@@ -843,15 +851,7 @@ class AdjustTimezoneSelect(discord.ui.Select):
     def __init__(self, draft: AvailabilityUpdateDraft):
         self.draft = draft
 
-        options = [
-            discord.SelectOption(
-                label=label,
-                value=value,
-                description=value,
-                default=draft.timezone == value,
-            )
-            for label, value in TIMEZONE_OPTIONS[:25]
-        ]
+        options = timezone_select_options(TIMEZONE_OPTIONS, draft.timezone)
 
         if not options:
             options = [
@@ -1341,15 +1341,7 @@ class TimezoneSelect(discord.ui.Select):
     def __init__(self, draft: QualificationRequestDraft):
         self.draft = draft
 
-        options = [
-            discord.SelectOption(
-                label=label,
-                value=value,
-                description=value,
-                default=draft.timezone == value,
-            )
-            for label, value in TIMEZONE_OPTIONS[:25]
-        ]
+        options = timezone_select_options(TIMEZONE_OPTIONS, draft.timezone)
 
         if not options:
             options = [

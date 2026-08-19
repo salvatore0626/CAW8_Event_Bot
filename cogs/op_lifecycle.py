@@ -46,6 +46,11 @@ try:
 except ImportError:
     OP_FLIGHT_VC_UPDATE_DELAY_SECONDS = 1.0
 
+try:
+    from config import OPERATION_LIFECYCLE_CHANNEL_ID
+except ImportError:
+    OPERATION_LIFECYCLE_CHANNEL_ID = 0
+
 from services.op_lifecycle_service import (
     ActiveConflict,
     LifecycleOp,
@@ -69,7 +74,43 @@ from services.op_lifecycle_service import (
 from services.reward_service import queue_reward_reconciliation
 
 from services.situation_room_service import queue_situation_room_refresh
+from services.op_execution_reminder_service import (
+    forget_op_opened,
+    remember_op_opened,
+)
 
+
+async def send_operation_open_announcement(
+    interaction: discord.Interaction,
+    *,
+    op_name: str,
+) -> None:
+    """Best-effort public announcement when an op is opened."""
+    try:
+        channel_id = int(OPERATION_LIFECYCLE_CHANNEL_ID or 0)
+    except (TypeError, ValueError):
+        channel_id = 0
+
+    if not channel_id:
+        return
+
+    channel = interaction.client.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await interaction.client.fetch_channel(channel_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return
+
+    if not isinstance(channel, discord.abc.Messageable):
+        return
+
+    try:
+        await channel.send(
+            f"{interaction.user.mention} has opened {str(op_name).upper()}\n"
+            "Please use /attend"
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        pass
 
 
 @dataclass
@@ -578,6 +619,8 @@ class CompleteOpenThenStartButton(discord.ui.Button):
             )
             return
 
+        forget_op_opened(self.view.open_conflict.event_id)
+
         queue_situation_room_refresh(
             interaction.client,
             reason="op complete then start",
@@ -667,6 +710,17 @@ class CompleteOpenThenOpenButton(discord.ui.Button):
             )
             return
 
+        forget_op_opened(self.view.open_conflict.event_id)
+        remember_op_opened(
+            event_id=self.view.target_op.event_id,
+            op_name=self.view.target_op.op_name,
+            opener_id=interaction.user.id,
+        )
+        await send_operation_open_announcement(
+            interaction,
+            op_name=self.view.target_op.op_name,
+        )
+
         queue_situation_room_refresh(
             interaction.client,
             reason="op complete then open",
@@ -737,6 +791,16 @@ class ConfirmOpenButton(discord.ui.Button):
             )
             return
 
+        remember_op_opened(
+            event_id=self.view.op.event_id,
+            op_name=self.view.op.op_name,
+            opener_id=interaction.user.id,
+        )
+        await send_operation_open_announcement(
+            interaction,
+            op_name=self.view.op.op_name,
+        )
+
         queue_situation_room_refresh(
             interaction.client,
             reason="op opened",
@@ -801,6 +865,8 @@ class ConfirmCompleteButton(discord.ui.Button):
                 ephemeral=True,
             )
             return
+
+        forget_op_opened(self.view.op.event_id)
 
         queue_situation_room_refresh(
             interaction.client,

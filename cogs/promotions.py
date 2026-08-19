@@ -3,6 +3,7 @@ from __future__ import annotations
 import discord
 from discord import app_commands
 from discord.ext import commands
+from services.admin_log_service import log_admin_action
 from services.permission_service import (
     require_admin_command,
     member_is_admin,
@@ -60,6 +61,7 @@ except ImportError:
 from services.promotion_service import (
     PromotionCandidate,
     all_rank_role_ids,
+    build_force_promotion_candidate,
     eligible_rank_choices,
     ensure_user_record,
     find_promotion_candidate_for_user,
@@ -130,6 +132,79 @@ async def has_promotion_permission(interaction: discord.Interaction) -> bool:
     return any(role.id in role_ids for role in interaction.user.roles)
 
 
+
+
+PROMOTION_GROUP_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("all", "All"),
+    ("Recruit|ENS", "Recruit → ENS"),
+    ("ENS|LTJG", "ENS → LTJG"),
+    ("LTJG|LT", "LTJG → LT"),
+    ("LT|LCDR", "LT → LCDR"),
+    ("LCDR|CDR", "LCDR → CDR"),
+    ("CDR|CAPT", "CDR → CAPT"),
+)
+
+
+def promotion_group_label(group_value: str) -> str:
+    for value, label in PROMOTION_GROUP_OPTIONS:
+        if value == group_value:
+            return label
+    return "All"
+
+
+def filter_candidates_by_promotion_group(
+    candidates: list[PromotionCandidate],
+    group_value: str,
+) -> list[PromotionCandidate]:
+    if group_value == "all":
+        return candidates
+
+    try:
+        current_rank, next_rank = group_value.split("|", 1)
+    except ValueError:
+        return candidates
+
+    return [
+        candidate
+        for candidate in candidates
+        if normalize_rank(candidate.current_rank) == normalize_rank(current_rank)
+        and normalize_rank(candidate.next_rank) == normalize_rank(next_rank)
+    ]
+
+
+def grouped_promotion_candidates(
+    candidates: list[PromotionCandidate],
+) -> list[tuple[str, str, list[PromotionCandidate]]]:
+    groups: dict[tuple[str, str], list[PromotionCandidate]] = {}
+
+    for candidate in candidates:
+        key = (candidate.current_rank, candidate.next_rank)
+        groups.setdefault(key, []).append(candidate)
+
+    return [
+        (current_rank, next_rank, grouped)
+        for (current_rank, next_rank), grouped in groups.items()
+    ]
+
+
+def promotion_names_code_block(candidates: list[PromotionCandidate]) -> str:
+    names = [candidate.username for candidate in candidates]
+    text = "\n".join(names) if names else "None"
+    return f"```\n{text}\n```"
+
+
+def add_promotion_group_fields(
+    embed: discord.Embed,
+    candidates: list[PromotionCandidate],
+) -> None:
+    for current_rank, next_rank, grouped in grouped_promotion_candidates(candidates):
+        value = promotion_names_code_block(grouped)
+        embed.add_field(
+            name=f"{current_rank} → {next_rank}",
+            value=value[:1024],
+            inline=False,
+        )
+
 def promotion_line(candidate: PromotionCandidate) -> str:
     return (
         f"- <@{candidate.discord_id}> `{candidate.username}`: "
@@ -148,12 +223,16 @@ def blocked_line(blocked) -> str:
 
 
 def promotion_confirm_text(candidates: list[PromotionCandidate]) -> str:
-    lines = [promotion_line(candidate) for candidate in candidates[:20]]
+    if not candidates:
+        return "No eligible users found."
 
-    if len(candidates) > 20:
-        lines.append(f"\n...and {len(candidates) - 20} more users.")
+    sections: list[str] = []
 
-    return "\n".join(lines) if lines else "No eligible users found."
+    for current_rank, next_rank, grouped in grouped_promotion_candidates(candidates):
+        names = "\n".join(candidate.username for candidate in grouped)
+        sections.append(f"**{current_rank} → {next_rank}**\n```\n{names}\n```")
+
+    return "\n\n".join(sections)
 
 
 def announcement_line(candidate: PromotionCandidate) -> str:
@@ -412,11 +491,33 @@ async def promote_candidates(
 
 
 class PromotionBoardView(discord.ui.View):
-    def __init__(self, *, owner_id: int, can_promote_all: bool):
+    def __init__(self, *, owner_id: int, candidates: list[PromotionCandidate]):
         super().__init__(timeout=300)
         self.owner_id = owner_id
-        self.add_item(DismissPromotionViewButton(row=0))
-        self.add_item(PromoteAllButton(disabled=not can_promote_all, row=0))
+        self.candidates = candidates
+        self.selected_group = "all"
+
+        self.group_select = PromotionGroupSelect(row=0)
+        self.promote_button = PromoteAllButton(row=1)
+
+        self.add_item(self.group_select)
+        self.add_item(DismissPromotionViewButton(row=1))
+        self.add_item(self.promote_button)
+        self.refresh_promote_button()
+
+    def refresh_promote_button(self) -> None:
+        label = promotion_group_label(self.selected_group)
+        selected_candidates = filter_candidates_by_promotion_group(
+            self.candidates,
+            self.selected_group,
+        )
+
+        self.promote_button.label = (
+            "Promote All"
+            if self.selected_group == "all"
+            else f"Promote All {label}"
+        )
+        self.promote_button.disabled = not bool(selected_candidates)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
@@ -429,6 +530,36 @@ class PromotionBoardView(discord.ui.View):
         return True
 
 
+class PromotionGroupSelect(discord.ui.Select):
+    def __init__(self, row: int):
+        options = [
+            discord.SelectOption(
+                label=label,
+                value=value,
+                default=(value == "all"),
+            )
+            for value, label in PROMOTION_GROUP_OPTIONS
+        ]
+        super().__init__(
+            placeholder="Select promotion group",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=row,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        assert isinstance(self.view, PromotionBoardView)
+
+        self.view.selected_group = self.values[0]
+
+        for option in self.options:
+            option.default = option.value == self.view.selected_group
+
+        self.view.refresh_promote_button()
+        await interaction.response.edit_message(view=self.view)
+
+
 class PromotionConfirmView(discord.ui.View):
     def __init__(
         self,
@@ -436,11 +567,13 @@ class PromotionConfirmView(discord.ui.View):
         owner_id: int,
         mode: str,
         candidate_discord_id: str | None = None,
+        promotion_group: str = "all",
     ):
         super().__init__(timeout=300)
         self.owner_id = owner_id
         self.mode = mode
         self.candidate_discord_id = candidate_discord_id
+        self.promotion_group = promotion_group
         self.add_item(CancelPromotionButton(row=0))
         self.add_item(ConfirmPromotionButton(row=0))
 
@@ -484,15 +617,20 @@ class CancelPromotionButton(discord.ui.Button):
 
 
 class PromoteAllButton(discord.ui.Button):
-    def __init__(self, *, disabled: bool, row: int):
+    def __init__(self, *, row: int):
         super().__init__(
             label="Promote All",
             style=discord.ButtonStyle.success,
-            disabled=disabled,
+            disabled=True,
             row=row,
         )
 
     async def callback(self, interaction: discord.Interaction):
+        assert isinstance(self.view, PromotionBoardView)
+
+        selected_group = self.view.selected_group
+        group_label = promotion_group_label(selected_group)
+
         candidates, _blocked = find_promotion_candidates()
 
         if interaction.guild is not None and candidates:
@@ -501,15 +639,26 @@ class PromoteAllButton(discord.ui.Button):
                 candidates=candidates,
             )
 
+        candidates = filter_candidates_by_promotion_group(
+            candidates,
+            selected_group,
+        )
+
         if not candidates:
             await interaction.response.send_message(
-                "No users are currently eligible for promotion.",
+                f"No users are currently eligible for **{group_label}** promotion.",
                 ephemeral=True,
             )
             return
 
+        title = (
+            "Confirm Promote All"
+            if selected_group == "all"
+            else f"Confirm Promote All {group_label}"
+        )
+
         embed = discord.Embed(
-            title="Confirm Promote All",
+            title=title,
             description=(
                 f"You are about to promote **{len(candidates)}** eligible user(s):\n\n"
                 f"{promotion_confirm_text(candidates)}"
@@ -523,6 +672,7 @@ class PromoteAllButton(discord.ui.Button):
             view=PromotionConfirmView(
                 owner_id=interaction.user.id,
                 mode="all",
+                promotion_group=selected_group,
             ),
         )
 
@@ -567,7 +717,7 @@ class ConfirmPromotionButton(discord.ui.Button):
                 view=None,
             )
 
-            if self.view.mode == "single":
+            if self.view.mode in {"single", "force"}:
                 if not self.view.candidate_discord_id:
                     await interaction.edit_original_response(
                         content="No user was selected for promotion.",
@@ -576,11 +726,14 @@ class ConfirmPromotionButton(discord.ui.Button):
                     )
                     return
 
-                candidate, reason = find_promotion_candidate_for_user(self.view.candidate_discord_id)
+                if self.view.mode == "force":
+                    candidate, reason = build_force_promotion_candidate(self.view.candidate_discord_id)
+                else:
+                    candidate, reason = find_promotion_candidate_for_user(self.view.candidate_discord_id)
 
                 if candidate is None:
                     await interaction.edit_original_response(
-                        content=f"That user is no longer eligible. {reason or ''}",
+                        content=f"That user can no longer be promoted. {reason or ''}",
                         embed=None,
                         view=None,
                     )
@@ -589,6 +742,10 @@ class ConfirmPromotionButton(discord.ui.Button):
                 candidates = [candidate]
             else:
                 candidates, _blocked = find_promotion_candidates()
+                candidates = filter_candidates_by_promotion_group(
+                    candidates,
+                    self.view.promotion_group,
+                )
 
             if candidates:
                 candidates, live_rank_skips = await filter_candidates_by_live_rank(
@@ -614,6 +771,23 @@ class ConfirmPromotionButton(discord.ui.Button):
                     f"- <@{candidate.discord_id}>: **{candidate.current_rank}** → **{candidate.next_rank}**"
                     for candidate in promoted
                 )
+
+            if self.view.mode == "force":
+                for candidate in promoted:
+                    log_admin_action(
+                        action="promotion_override",
+                        user_discord_id=candidate.discord_id,
+                        performed_by_id=interaction.user.id,
+                        before_json={
+                            "command": "/promote",
+                            "rank": candidate.current_rank,
+                            "completed_ops": candidate.total_ops,
+                            "unique_ops": candidate.unique_ops,
+                            "required_ops": candidate.required_total_ops,
+                            "required_unique_ops": candidate.required_unique_ops,
+                        },
+                        after_json={"rank": candidate.next_rank},
+                    )
 
             combined_errors = live_rank_skips + errors
 
@@ -684,9 +858,29 @@ class PromotionsCog(commands.Cog):
             candidate, reason = find_promotion_candidate_for_user(str(user.id))
 
             if candidate is None:
+                force_candidate, force_reason = build_force_promotion_candidate(str(user.id))
                 live_note = f" Current Discord rank role: **{live_rank}**." if live_rank else ""
+                if force_candidate is None:
+                    await interaction.response.send_message(
+                        f"{user.mention} cannot be promoted. {force_reason or reason or ''}{live_note}",
+                        ephemeral=True,
+                    )
+                    return
+                embed = discord.Embed(
+                    title="Force Promotion?",
+                    description=(
+                        f"{user.mention} does not meet the normal promotion requirements.\n\n"
+                        f"{promotion_line(force_candidate)}\n\n"
+                        "Confirming will promote them anyway and create a `promotion_override` audit entry."
+                    ),
+                )
                 await interaction.response.send_message(
-                    f"{user.mention} is not currently eligible for promotion. {reason or ''}{live_note}",
+                    embed=embed,
+                    view=PromotionConfirmView(
+                        owner_id=interaction.user.id,
+                        mode="force",
+                        candidate_discord_id=str(user.id),
+                    ),
                     ephemeral=True,
                 )
                 return
@@ -722,19 +916,17 @@ class PromotionsCog(commands.Cog):
                 candidates=candidates,
             )
 
-        if candidates:
-            lines = [promotion_line(candidate) for candidate in candidates[:20]]
-            description = "\n".join(lines)
-
-            if len(candidates) > 20:
-                description += f"\n\n...and {len(candidates) - 20} more eligible users."
-        else:
-            description = "No users are currently eligible for promotion."
-
         embed = discord.Embed(
             title="Promotion Board",
-            description=description[:4000],
+            description=(
+                f"**{len(candidates)}** user(s) are currently eligible."
+                if candidates
+                else "No users are currently eligible for promotion."
+            ),
         )
+
+        if candidates:
+            add_promotion_group_fields(embed, candidates)
 
         if live_rank_skips:
             embed.add_field(
@@ -756,13 +948,13 @@ class PromotionsCog(commands.Cog):
                 inline=False,
             )
 
-        embed.set_footer(text="Use Promote All to confirm and apply all listed eligible promotions.")
+        embed.set_footer(text="Select a promotion group, then use the green Promote All button to apply that group.")
 
         await interaction.followup.send(
             embed=embed,
             view=PromotionBoardView(
                 owner_id=interaction.user.id,
-                can_promote_all=bool(candidates),
+                candidates=candidates,
             ),
             ephemeral=True,
         )

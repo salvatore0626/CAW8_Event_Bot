@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
 
 import discord
 from discord import app_commands
@@ -26,30 +25,8 @@ try:
 except ImportError:
     STAFF_ROLE = 0
 
-try:
-    from config import CHANNEL_ID_NORMAL
-except ImportError:
-    CHANNEL_ID_NORMAL = 0
-
-try:
-    from config import CHANNEL_ID_TOURNAMENT
-except ImportError:
-    CHANNEL_ID_TOURNAMENT = 0
-
-try:
-    from config import CHANNEL_ID_MINI
-except ImportError:
-    CHANNEL_ID_MINI = 0
-
-try:
-    from config import CHANNEL_ID_ARCADE
-except ImportError:
-    CHANNEL_ID_ARCADE = 0
-
-try:
-    from config import SCHEDULE_EVENT_DURATION_HOURS
-except ImportError:
-    SCHEDULE_EVENT_DURATION_HOURS = 3
+from services.situation_room_service import queue_situation_room_refresh_now
+from services.admin_log_service import log_admin_action
 
 from services.schedule_service import (
     OpEventRecord,
@@ -61,7 +38,6 @@ from services.schedule_service import (
     get_user_timezone,
     is_default_slot_timestamp,
     now_ts,
-    set_event_server_event_id,
     uncancel_op_event,
 )
 
@@ -166,90 +142,6 @@ def queue_discord_server_event_cancel(
             server_event_id,
         )
     )
-
-
-def channel_id_for_op_type(op_type: str) -> int:
-    normalized = str(op_type or "").strip().lower()
-
-    if normalized == "tournament":
-        return int(CHANNEL_ID_TOURNAMENT or CHANNEL_ID_NORMAL or 0)
-
-    if normalized in {"mini", "mini op", "mini-op"}:
-        return int(CHANNEL_ID_MINI or CHANNEL_ID_NORMAL or 0)
-
-    if normalized == "arcade":
-        return int(CHANNEL_ID_ARCADE or CHANNEL_ID_NORMAL or 0)
-
-    return int(CHANNEL_ID_NORMAL or 0)
-
-
-async def get_event_channel_by_type(
-    guild: discord.Guild,
-    op_type: str,
-) -> discord.abc.GuildChannel:
-    channel_id = channel_id_for_op_type(op_type)
-
-    if not channel_id:
-        raise ValueError(
-            "No event channel is configured for this op type. "
-            "Set CHANNEL_ID_NORMAL / CHANNEL_ID_TOURNAMENT / CHANNEL_ID_MINI / CHANNEL_ID_ARCADE in config.py."
-        )
-
-    channel = guild.get_channel(int(channel_id))
-
-    if channel is None:
-        channel = await guild.fetch_channel(int(channel_id))
-
-    if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
-        raise ValueError("The configured event channel must be a voice or stage channel.")
-
-    return channel
-
-
-def scheduled_event_entity_type(channel: discord.abc.GuildChannel) -> discord.EntityType:
-    if isinstance(channel, discord.StageChannel):
-        return discord.EntityType.stage_instance
-
-    return discord.EntityType.voice
-
-
-async def recreate_discord_server_event(
-    *,
-    guild: discord.Guild,
-    event: OpEventRecord,
-    created_by: discord.abc.User,
-) -> discord.ScheduledEvent:
-    channel = await get_event_channel_by_type(guild, event.op_type)
-
-    start_time = datetime.fromtimestamp(int(event.scheduled_at), timezone.utc)
-    end_time = start_time + timedelta(hours=float(SCHEDULE_EVENT_DURATION_HOURS or 3))
-
-    description = f"{event.op_name} operation event."
-
-    return await guild.create_scheduled_event(
-        name=event.op_name[:100],
-        description=description[:1000],
-        start_time=start_time,
-        end_time=end_time,
-        privacy_level=discord.PrivacyLevel.guild_only,
-        entity_type=scheduled_event_entity_type(channel),
-        channel=channel,
-        reason=f"Uncancelled / recreated by {created_by}",
-    )
-
-
-async def delete_discord_server_event_silent(
-    guild: discord.Guild | None,
-    server_event_id: str | None,
-) -> None:
-    if guild is None or not server_event_id:
-        return
-
-    try:
-        event = await guild.fetch_scheduled_event(int(server_event_id))
-        await event.delete(reason="Cleaning up after uncancel DB failure")
-    except Exception:
-        pass
 
 
 
@@ -903,6 +795,26 @@ class ConfirmCancelEventButton(discord.ui.Button):
             )
             return
 
+        log_admin_action(
+            action="event_cancelled",
+            performed_by_id=interaction.user.id,
+            before_json={
+                "command": "/scheduleview",
+                "event_id": self.view.event.event_id,
+                "operation": self.view.event.op_name,
+                "scheduled_at": self.view.event.scheduled_at,
+                "status": self.view.event.status,
+            },
+            after_json={
+                "event_id": self.view.event.event_id,
+                "status": "Canceled",
+            },
+        )
+
+        # Removing the event from the active schedule changes the desired board
+        # set, so remove/reorder Situation Room boards immediately.
+        queue_situation_room_refresh_now(interaction.client)
+
         events = get_filtered_schedule_events(
             sort_by=self.view.sort_by,
             hidden_filters=self.view.hidden_filters,
@@ -982,39 +894,36 @@ class ConfirmUncancelEventButton(discord.ui.Button):
 
         await interaction.response.defer()
 
-        new_server_event_id: str | None = None
-
         try:
-            server_event = await recreate_discord_server_event(
-                guild=interaction.guild,
-                event=self.view.event,
-                created_by=interaction.user,
-            )
-            new_server_event_id = str(server_event.id)
-        except Exception as error:
-            await interaction.followup.send(
-                f"Failed to recreate the Discord server event: `{error}`",
-                ephemeral=True,
-            )
-            return
-
-        try:
+            # Restore the Airboss event only. Uncanceling does not recreate a
+            # Discord Scheduled Event or require any configured event channel.
             uncancel_op_event(self.view.event.event_id)
-            set_event_server_event_id(
-                event_id=self.view.event.event_id,
-                server_event_id=new_server_event_id,
-            )
         except Exception as error:
-            await delete_discord_server_event_silent(
-                interaction.guild,
-                new_server_event_id,
-            )
-
             await interaction.followup.send(
-                f"Discord event was created, but the database update failed: `{error}`",
+                f"Failed to uncancel the event: `{error}`",
                 ephemeral=True,
             )
             return
+
+        log_admin_action(
+            action="event_uncancelled",
+            performed_by_id=interaction.user.id,
+            before_json={
+                "command": "/scheduleview",
+                "event_id": self.view.event.event_id,
+                "operation": self.view.event.op_name,
+                "scheduled_at": self.view.event.scheduled_at,
+                "status": self.view.event.status,
+            },
+            after_json={
+                "event_id": self.view.event.event_id,
+                "status": "Scheduled",
+            },
+        )
+
+        # Recreate the flight-lead reservation board immediately after the
+        # canceled event has been restored in the database.
+        queue_situation_room_refresh_now(interaction.client)
 
         events = get_filtered_schedule_events(
             sort_by=self.view.sort_by,

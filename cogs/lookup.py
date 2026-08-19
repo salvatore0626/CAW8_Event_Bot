@@ -12,7 +12,7 @@ from services.lookup_service import (
     LookupSummary,
     build_lookup_export,
     build_lookup_summary,
-    manual_award_summary_lines,
+    award_count_items,
 )
 from services.permission_service import (
     require_mission_qualified_command,
@@ -38,83 +38,86 @@ def position_text(value: int | None) -> str:
     return f"#{value}" if value is not None else "—"
 
 
+def metric_lines(rows: list[tuple[str, str]]) -> str:
+    return "\n".join(f"**{label}:** `{value}`" for label, value in rows)
 
-def awards_summary_text(summary: LookupSummary) -> str:
-    lines = [
-        f"**ACE:** {summary.ace_awards}  |  **Golden Wrench:** {summary.golden_wrench_awards}",
-        f"**Safety S:** {summary.safety_s_awards}",
-    ]
 
-    manual_lines = manual_award_summary_lines(summary.manual_award_counts)
+def recent_awards_text(summary: LookupSummary) -> str:
+    if not summary.recent_awards:
+        return "No active awards recorded."
 
-    if manual_lines:
-        lines.append("**Manual Awards:**")
-        lines.extend(manual_lines)
-
+    lines: list[str] = []
+    for award in summary.recent_awards:
+        award_type = str(award.get("award_type") or "Award")
+        display = {
+            "ACE": "ACE",
+            "GOLDEN_WRENCH": "Golden Wrench",
+            "SAFETY_S": "Safety S",
+        }.get(award_type, award_type.replace("_", " ").title())
+        operation = str(award.get("operation_name") or "Unknown Operation")
+        event_id = award.get("source_event_id")
+        event_text = f" · OP #{event_id}" if event_id is not None else ""
+        lines.append(f"**{display}** — {operation}{event_text}")
     return "\n".join(lines)
+
 
 def summary_embed(summary: LookupSummary) -> discord.Embed:
     gpa = (
-        f"{summary.career_gpa:.3f} "
-        f"({summary.career_gpa_attempts} attempts)"
+        f"{summary.career_gpa:.3f} ({summary.career_gpa_attempts} attempts)"
         if summary.career_gpa is not None
-        else "—"
+        else f"— ({summary.career_gpa_attempts} attempts)"
     )
 
     embed = discord.Embed(
         title=f"Op Record for {summary.display_name}",
-        description=(
-            "Full attendance and award history is attached as a text export."
-        ),
+        description="Full attendance and active award history is attached.",
     )
     embed.add_field(
         name="Attendance",
-        value=(
-            f"**Ops attended:** {summary.ops_attended}\n"
-            f"**Unique op templates:** {summary.unique_ops_attended}"
-        ),
-        inline=True,
-    )
-    embed.add_field(
-        name="Survival",
-        value=(
-            f"**Clean-op streak:** {summary.deathless_current_streak}\n"
-            f"**Deathless ops:** {summary.deathless_total}"
-        ),
-        inline=True,
-    )
-    embed.add_field(
-        name="Carrier Recovery",
-        value=(
-            f"**Clean-carrier streak:** {summary.bolterless_current_streak}\n"
-            f"**Bolterless carrier ops:** {summary.bolterless_total}\n"
-            f"**Career GPA:** {gpa}"
-        ),
-        inline=True,
-    )
-    embed.add_field(
-        name="Awards",
-        value=awards_summary_text(summary),
+        value=metric_lines([
+            ("Ops Attended", str(summary.ops_attended)),
+            ("Unique Ops", str(summary.unique_ops_attended)),
+        ]),
         inline=False,
     )
     embed.add_field(
-        name="Qualification",
-        value=f"**Highest qualified rank:** {summary.highest_qualified_rank}",
-        inline=True,
+        name="Stats",
+        value=metric_lines([
+            ("Deathless Ops", str(summary.deathless_total)),
+            ("Deathless Streak", str(summary.deathless_current_streak)),
+            ("Bolterless Ops", str(summary.bolterless_total)),
+            ("Bolterless Streak", str(summary.bolterless_current_streak)),
+            ("Career GPA", gpa),
+            ("Flight lead rating", summary.flight_lead_rating_text),
+        ]),
+        inline=False,
     )
     embed.add_field(
-        name="All-Time Leaderboard Positions",
-        value=(
-            f"**Attendance:** {position_text(summary.attendance_position)}\n"
-            f"**Wire GPA:** {position_text(summary.wire_gpa_position)}\n"
-            f"**Survival:** {position_text(summary.survival_position)}"
-        ),
-        inline=True,
+        name="Awards",
+        value=metric_lines([
+            (name, str(count))
+            for name, count in award_count_items(summary.manual_award_counts)
+        ]),
+        inline=False,
+    )
+    embed.add_field(
+        name="Leaderboard Positions",
+        value=metric_lines([
+            ("Attendance", position_text(summary.attendance_position)),
+            ("GPA", position_text(summary.wire_gpa_position)),
+            ("Survival", position_text(summary.survival_position)),
+        ]),
+        inline=False,
+    )
+    embed.add_field(
+        name="Most Recent Awards",
+        value=recent_awards_text(summary),
+        inline=False,
     )
     embed.set_footer(
         text=(
-            "GPA scale: 1-wire = 1.0 | 2-wire = 2.0 | "
-            "3-wire = 4.0 | 4-wire = 3.0 | Bolter = 0.0"
+            f"Highest qualified rank: {summary.highest_qualified_rank} | "
+            "GPA: bolters count as 0-point attempts"
         )
     )
     return embed
@@ -139,7 +142,7 @@ class LookupCog(commands.Cog):
     async def lookup(
         self,
         interaction: discord.Interaction,
-        user: discord.Member,
+        user: discord.Member | None = None,
         visibility: str = "hidden",
     ):
         # Acknowledge immediately. The export can run several full-history
@@ -148,6 +151,7 @@ class LookupCog(commands.Cog):
             return
 
         hidden = not lookup_is_public(visibility)
+        user = user or interaction.user
 
         try:
             await interaction.response.defer(thinking=True, ephemeral=hidden)

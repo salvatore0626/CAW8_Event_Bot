@@ -81,6 +81,7 @@ def confirm_send_key(
         str(view.selected_start),
     )
 
+from services.user_settings_service import safe_zoneinfo
 from services.permission_service import (
     member_is_admin,
     member_has_any_role,
@@ -102,6 +103,13 @@ from services.training_interest_service import (
     update_user_training_notifications,
     user_training_interest_keys,
 )
+
+
+def member_can_use_instructor_panel(member: discord.Member) -> bool:
+    return member_is_admin(member) or member_has_any_role(
+        member,
+        instructor_role_ids(),
+    )
 
 
 TRAINING_START_OPTIONS = [
@@ -178,7 +186,7 @@ def local_time_label(timezone: str | None, start_value: str | None) -> str | Non
         return None
 
     try:
-        local_dt = datetime.now(ZoneInfo(str(timezone))) + timedelta(minutes=minutes)
+        local_dt = datetime.now(safe_zoneinfo(timezone)) + timedelta(minutes=minutes)
     except ZoneInfoNotFoundError:
         return None
     except Exception:
@@ -286,6 +294,7 @@ class TrainingSignupView(discord.ui.View):
 
         self.add_item(TrainingNotifySelect(self))
         self.add_item(TrainingTopicSelect(self))
+        self.add_item(InstructorPanelButton(self))
         self.add_item(ExitSignupButton(self))
         self.add_item(SubmitSignupButton(self))
 
@@ -350,6 +359,42 @@ class TrainingTopicSelect(discord.ui.Select):
         assert isinstance(self.view, TrainingSignupView)
         self.view.draft_topics = set(self.values)
         await self.view.refresh(interaction)
+
+
+class InstructorPanelButton(discord.ui.Button):
+    def __init__(self, parent: TrainingSignupView):
+        allowed = member_can_use_instructor_panel(parent.member)
+
+        super().__init__(
+            label="Instructor Panel",
+            style=discord.ButtonStyle.secondary,
+            disabled=not allowed,
+            row=3,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "This command can only be used inside the server.",
+                ephemeral=True,
+            )
+            return
+
+        if not member_can_use_instructor_panel(interaction.user):
+            await interaction.response.send_message(
+                "Sorry, that is for Instructor only.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.edit_message(
+            content=None,
+            embed=build_roster_embed(guild=interaction.guild),
+            view=RosterView(
+                owner_id=interaction.user.id,
+                guild=interaction.guild,
+            ),
+        )
 
 
 class ExitSignupButton(discord.ui.Button):
@@ -653,7 +698,7 @@ class RosterView(discord.ui.View):
         self.add_item(RosterTopicSelect(self))
         self.add_item(RosterVoiceSelect(self))
         self.add_item(RosterStartSelect(self))
-        self.add_item(ExitRosterButton())
+        self.add_item(BackToSignupButton())
         self.add_item(DMInterestedUsersButton(self))
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -671,7 +716,7 @@ class RosterView(discord.ui.View):
             )
             return False
 
-        if not (member_is_admin(interaction.user) or member_has_any_role(interaction.user, instructor_role_ids())):
+        if not member_can_use_instructor_panel(interaction.user):
             await interaction.response.send_message(
                 "Sorry, that is for Instructor only.",
                 ephemeral=True,
@@ -745,7 +790,7 @@ class RosterVoiceSelect(discord.ui.Select):
 
         if not self.values or self.values[0] == "0":
             await interaction.response.send_message(
-                "No training voice channels are configured for /roster.",
+                "No training voice channels are configured for /mass training.",
                 ephemeral=True,
             )
             return
@@ -771,19 +816,36 @@ class RosterStartSelect(discord.ui.Select):
         await self.view.refresh(interaction)
 
 
-class ExitRosterButton(discord.ui.Button):
+class BackToSignupButton(discord.ui.Button):
     def __init__(self):
         super().__init__(
-            label="Exit",
-            style=discord.ButtonStyle.danger,
+            label="Back",
+            style=discord.ButtonStyle.secondary,
             row=3,
         )
 
     async def callback(self, interaction: discord.Interaction):
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "This command can only be used inside the server.",
+                ephemeral=True,
+            )
+            return
+
+        ensure_member(interaction.user)
+
+        saved_topics = user_training_interest_keys(str(interaction.user.id))
+        saved_notify = get_user_training_notify(str(interaction.user.id))
+        new_view = TrainingSignupView(
+            member=interaction.user,
+            saved_topics=saved_topics,
+            saved_notify=saved_notify,
+        )
+
         await interaction.response.edit_message(
-            content="Roster closed.",
-            embed=None,
-            view=None,
+            content=None,
+            embed=build_signup_embed(interaction.user, new_view),
+            view=new_view,
         )
 
 
@@ -914,7 +976,7 @@ class ConfirmTrainingDMView(discord.ui.View):
             )
             return False
 
-        if not (member_is_admin(interaction.user) or member_has_any_role(interaction.user, instructor_role_ids())):
+        if not member_can_use_instructor_panel(interaction.user):
             await interaction.response.send_message(
                 "Sorry, that is for Instructor only.",
                 ephemeral=True,
@@ -1080,14 +1142,14 @@ class TrainingCommands(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    training_group = app_commands.Group(
-        name="training",
-        description="Training commands",
+    mass_group = app_commands.Group(
+        name="mass",
+        description="Mass training commands",
     )
 
-    @training_group.command(
-        name="signup",
-        description="Sign up for training interest notifications.",
+    @mass_group.command(
+        name="training",
+        description="Manage training sign-ups and instructor tools.",
     )
     @app_commands.guild_only()
     async def training_signup(self, interaction: discord.Interaction):
@@ -1115,31 +1177,6 @@ class TrainingCommands(commands.Cog):
             ephemeral=True,
         )
 
-    @app_commands.command(
-        name="roster",
-        description="View training interest roster and send training DMs.",
-    )
-    @app_commands.guild_only()
-    async def roster(self, interaction: discord.Interaction):
-        if not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message(
-                "This command can only be used inside the server.",
-                ephemeral=True,
-            )
-            return
-
-        if not (member_is_admin(interaction.user) or member_has_any_role(interaction.user, instructor_role_ids())):
-            await interaction.response.send_message(
-                "Sorry, that is for Instructor only.",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.send_message(
-            embed=build_roster_embed(guild=interaction.guild),
-            view=RosterView(owner_id=interaction.user.id, guild=interaction.guild),
-            ephemeral=True,
-        )
 
 
 async def setup(bot: commands.Bot):
