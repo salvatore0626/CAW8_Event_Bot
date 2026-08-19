@@ -434,6 +434,8 @@ def load_attendance_stats() -> dict[str, dict[str, int]]:
             WHERE a.discord_id IS NOT NULL
               AND TRIM(a.discord_id) != ''
               AND a.status IN ('submitted', 'complete')
+              AND oe.status = 'Complete'
+              AND ot.type = 'Normal'
             GROUP BY a.discord_id
             """
         ).fetchall()
@@ -467,9 +469,11 @@ def load_do_not_promote_map() -> dict[str, str]:
 
 
 def username_from_user_row(row: Any) -> str:
+    # Promotion board/code-block labels should prefer the member's server
+    # display name (nickname) over their Discord account username.
     return (
-        clean_text(row["discord_username"])
-        or clean_text(row["display_name"])
+        clean_text(row["display_name"])
+        or clean_text(row["discord_username"])
         or str(row["discord_id"])
     )
 
@@ -630,3 +634,42 @@ def find_promotion_candidate_for_user(discord_id: str) -> tuple[PromotionCandida
     )
 
     return candidate, reason
+
+
+def build_force_promotion_candidate(discord_id: str) -> tuple[PromotionCandidate | None, str | None]:
+    """Build the next-rank candidate while intentionally ignoring op minimums."""
+    stats_by_user = load_attendance_stats()
+    blocked_by_user = load_do_not_promote_map()
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT discord_id, discord_username, display_name, rank, status
+            FROM users WHERE discord_id = ? LIMIT 1
+            """,
+            (clean_text(discord_id),),
+        ).fetchone()
+    if row is None:
+        return None, "User is not in the users table yet."
+    if row["status"] != "Active":
+        return None, f"User status is {row['status']}; only Active users may be promoted."
+    current_rank = normalize_rank(row["rank"])
+    next_rank = next_managed_rank(current_rank)
+    if next_rank is None:
+        return None, f"Current rank {current_rank or 'Unknown'} has no managed next rank."
+    max_rank = blocked_by_user.get(clean_text(discord_id))
+    if not promotion_allowed_by_max_rank(next_rank, max_rank):
+        return None, f"User is capped at {max_rank} by do_not_promote."
+    stats = stats_by_user.get(clean_text(discord_id), {"total_ops": 0, "unique_ops": 0})
+    requirement = promotion_requirement_for(next_rank)
+    username = clean_text(row["display_name"]) or clean_text(row["discord_username"]) or clean_text(discord_id) or "Unknown"
+    return PromotionCandidate(
+        discord_id=clean_text(discord_id) or "",
+        username=username,
+        current_rank=current_rank,
+        next_rank=next_rank,
+        total_ops=int(stats.get("total_ops", 0)),
+        unique_ops=int(stats.get("unique_ops", 0)),
+        required_total_ops=int(requirement.get("total_ops", 0)),
+        required_unique_ops=int(requirement.get("unique_ops", 0)),
+        max_rank=max_rank,
+    ), None

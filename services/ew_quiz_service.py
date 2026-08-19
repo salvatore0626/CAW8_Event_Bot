@@ -88,13 +88,16 @@ def now_ts() -> int:
     return int(time.time())
 
 
+BOT_DIR = Path(__file__).resolve().parents[1]
+
+
 def quiz_file_path() -> Path:
-    path = Path(str(EW_QUIZ_JSON_PATH))
+    path = Path(str(EW_QUIZ_JSON_PATH)).expanduser()
 
-    if path.is_absolute():
-        return path
+    if not path.is_absolute():
+        path = BOT_DIR / path
 
-    return Path.cwd() / path
+    return path.resolve()
 
 
 def ensure_schema() -> None:

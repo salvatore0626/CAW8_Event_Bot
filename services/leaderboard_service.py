@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import re
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,7 +34,7 @@ except ImportError:
 try:
     from config import LEADERBOARD_STATE_FILE
 except ImportError:
-    LEADERBOARD_STATE_FILE = "leaderboard_messages.json"
+    LEADERBOARD_STATE_FILE = "data/leaderboard_messages.json"
 
 try:
     from config import LEADERBOARD_UPDATE_DELAY_SECONDS
@@ -91,6 +92,11 @@ try:
     from config import LEADERBOARD_RECENT_HIGHLIGHT_DAYS
 except ImportError:
     LEADERBOARD_RECENT_HIGHLIGHT_DAYS = 7
+
+try:
+    from config import LEADERBOARD_RECENT_HIGHLIGHT_EVENT
+except ImportError:
+    LEADERBOARD_RECENT_HIGHLIGHT_EVENT = False
 
 
 DEFAULT_DECORATION_INTROS = {
@@ -239,13 +245,119 @@ def min_survival_ops() -> int:
         return 5
 
 
+def _bot_root() -> Path:
+    # services/leaderboard_service.py -> Bookkeeperv1.3/
+    return Path(__file__).resolve().parents[1]
+
+
 def state_file_path() -> Path:
     configured = Path(str(LEADERBOARD_STATE_FILE))
 
     if configured.is_absolute():
         return configured
 
-    return Path.cwd() / configured
+    return _bot_root() / configured
+
+
+def _legacy_state_file_candidates() -> list[Path]:
+    """
+    Old versions resolved relative state files through Path.cwd(), which could
+    create leaderboard_messages.json in different root folders depending on how
+    the bot was launched.
+
+    Check the common old locations and move the active one into data/ on first run.
+    """
+    filename = "leaderboard_messages.json"
+    candidates = [
+        Path.cwd() / filename,
+        _bot_root() / filename,
+        _bot_root().parent / filename,
+    ]
+
+    unique: list[Path] = []
+    seen: set[Path] = set()
+
+    for candidate in candidates:
+        try:
+            key = candidate.resolve()
+        except Exception:
+            key = candidate
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        unique.append(candidate)
+
+    return unique
+
+
+def migrate_state_file_if_needed() -> None:
+    """Move legacy root state into the configured data path exactly once.
+
+    Some older configurations explicitly pointed at ``leaderboard_messages.json`` in the
+    Bookkeeper root. If both files exist, keep the newer one so switching the
+    configuration to ``data/`` does not restore stale Discord message IDs.
+    """
+    target = state_file_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    root_legacy = _bot_root() / "leaderboard_messages.json"
+
+    try:
+        same_path = root_legacy.resolve() == target.resolve()
+    except Exception:
+        same_path = root_legacy == target
+
+    if not same_path and root_legacy.exists():
+        try:
+            use_legacy = (
+                not target.exists()
+                or root_legacy.stat().st_mtime_ns >= target.stat().st_mtime_ns
+            )
+
+            if use_legacy:
+                temporary = target.with_name(target.name + ".migrating")
+                shutil.copy2(root_legacy, temporary)
+                temporary.replace(target)
+                print(f"✅ Migrated newer leaderboard state JSON to: {target}")
+
+            # The data-folder file is now authoritative. Removing the root copy
+            # prevents future confusion and confirms the migration completed.
+            if target.exists():
+                root_legacy.unlink()
+                print(f"✅ Removed legacy leaderboard state JSON: {root_legacy}")
+        except Exception as error:
+            print(
+                f"⚠️ Could not migrate leaderboard state JSON "
+                f"from {root_legacy} to {target}: {error}"
+            )
+
+    if target.exists():
+        return
+
+    # Retain compatibility with still older launches that resolved the path
+    # relative to the process working directory or the bots parent directory.
+    for legacy_path in _legacy_state_file_candidates():
+        try:
+            if legacy_path.resolve() == target.resolve():
+                continue
+        except Exception:
+            pass
+
+        if not legacy_path.exists():
+            continue
+
+        try:
+            shutil.move(str(legacy_path), str(target))
+            print(f"✅ Moved leaderboard state JSON to data folder: {target}")
+            return
+        except Exception as error:
+            print(
+                f"⚠️ Could not move leaderboard state JSON "
+                f"from {legacy_path} to {target}: {error}"
+            )
+
 
 
 def default_state() -> dict[str, Any]:
@@ -258,6 +370,7 @@ def default_state() -> dict[str, Any]:
 
 
 def load_state() -> dict[str, Any]:
+    migrate_state_file_if_needed()
     path = state_file_path()
 
     if not path.exists():
@@ -294,6 +407,7 @@ def load_state() -> dict[str, Any]:
 
 
 def save_state(state: dict[str, Any]) -> None:
+    migrate_state_file_if_needed()
     path = state_file_path()
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -481,7 +595,7 @@ def overall_wire_gpa_leaders(
               AND oe.scheduled_at <= ?
               AND a.status IN ('submitted', 'complete')
               AND a.discord_id IS NOT NULL
-              AND a.landing_type = 'Arrested'
+              AND a.landing_type IN ('Arrested', 'FTR')
               AND (
                     a.wires BETWEEN 1 AND 4
                  OR COALESCE(a.bolters, 0) > 0
@@ -625,7 +739,7 @@ def wire_gpa_leaders_for_airframe(
               AND oe.scheduled_at <= ?
               AND a.status IN ('submitted', 'complete')
               AND a.discord_id IS NOT NULL
-              AND a.landing_type = 'Arrested'
+              AND a.landing_type IN ('Arrested', 'FTR')
               AND (
                     a.wires BETWEEN 1 AND 4
                  OR COALESCE(a.bolters, 0) > 0
@@ -705,6 +819,7 @@ def code_safe(value: Any) -> str:
 
 ANSI_RESET = "\u001b[0m"
 ANSI_RECENT_HIGHLIGHT = "\u001b[1;34m"  # bold blue
+ANSI_LATEST_EVENT_HIGHLIGHT = "\u001b[1;35m"  # bold purple/magenta
 
 
 def ansi_code_block(lines: list[str]) -> str:
@@ -730,35 +845,63 @@ def leaderboard_code_block(
     return f"```\n{chr(10).join(lines)[:980]}\n```"
 
 
-def recent_highlight_cutoff_ts() -> int:
+def recent_highlight_days() -> int:
     try:
-        days = max(1, int(LEADERBOARD_RECENT_HIGHLIGHT_DAYS))
+        return max(1, int(LEADERBOARD_RECENT_HIGHLIGHT_DAYS))
     except (TypeError, ValueError):
-        days = 7
+        return 7
 
-    return now_ts() - (days * 24 * 60 * 60)
+
+def recent_highlight_cutoff_ts() -> int:
+    return now_ts() - (recent_highlight_days() * 24 * 60 * 60)
 
 
 def highlighted_decoration_code_block(
-    rows: list[tuple[str, bool]],
+    rows: list[tuple[str, str | None]],
 ) -> str:
     if not rows:
         return "```\nNo qualifying data in this window yet.\n```"
 
-    has_recent_highlight = any(is_recent for _line, is_recent in rows)
+    has_highlight = any(highlight for _line, highlight in rows)
 
-    if not has_recent_highlight:
-        return f"```\n{chr(10).join(line for line, _recent in rows)[:980]}\n```"
+    if not has_highlight:
+        return f"```\n{chr(10).join(line for line, _highlight in rows)[:980]}\n```"
 
-    lines = [
-        (
-            f"{ANSI_RECENT_HIGHLIGHT}{line}{ANSI_RESET}"
-            if is_recent
-            else line
-        )
-        for line, is_recent in rows
-    ]
+    lines: list[str] = []
+    for line, highlight in rows:
+        if highlight == "latest_event":
+            lines.append(f"{ANSI_LATEST_EVENT_HIGHLIGHT}{line}{ANSI_RESET}")
+        elif highlight == "recent":
+            lines.append(f"{ANSI_RECENT_HIGHLIGHT}{line}{ANSI_RESET}")
+        else:
+            lines.append(line)
+
     return ansi_code_block(lines)
+
+
+def latest_completed_normal_event_id() -> int | None:
+    """Return the newest completed Normal operation used by the Great Feats board."""
+    if not bool(LEADERBOARD_RECENT_HIGHLIGHT_EVENT):
+        return None
+
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT oe.event_id
+            FROM op_events oe
+            JOIN op_templates ot
+                ON ot.id = oe.op_template_id
+            WHERE oe.status = 'Complete'
+              AND ot.type = 'Normal'
+            ORDER BY oe.scheduled_at DESC, oe.event_id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    return int(row["event_id"])
 
 
 
@@ -954,8 +1097,9 @@ def award_lines(
     *,
     award_type: str,
     awards: list[dict[str, Any]],
+    latest_event_id: int | None = None,
 ) -> str:
-    lines: list[tuple[str, bool]] = []
+    lines: list[tuple[str, str | None]] = []
     highlight_cutoff = recent_highlight_cutoff_ts()
     should_highlight_recent = award_type in {
         "ACE",
@@ -988,14 +1132,30 @@ def award_lines(
             line = f"{player} - {event_label}"
 
         earned_at = int(row.get("earned_at") or 0)
+        source_event_id = row.get("source_event_id")
+
+        is_latest_event = (
+            latest_event_id is not None
+            and source_event_id is not None
+            and int(source_event_id) == int(latest_event_id)
+        )
         is_recent = should_highlight_recent and earned_at >= highlight_cutoff
-        lines.append((code_safe(line), is_recent))
+
+        highlight: str | None = None
+        if is_latest_event:
+            # Latest completed event takes priority over the normal recent-blue color.
+            highlight = "latest_event"
+        elif is_recent:
+            highlight = "recent"
+
+        lines.append((code_safe(line), highlight))
 
     return highlighted_decoration_code_block(lines)
 
 
 
 def decorations_embed(*, since_ts: int, until_ts: int) -> discord.Embed:
+    latest_event_id = latest_completed_normal_event_id()
     grouped = recent_active_awards(
         since_ts=since_ts,
         limit_per_type=award_list_limit(),
@@ -1027,18 +1187,34 @@ def decorations_embed(*, since_ts: int, until_ts: int) -> discord.Embed:
 
         if category == "FIRST_TIME":
             highlight_cutoff = recent_highlight_cutoff_ts()
-            names = [
-                (
-                    code_safe(player_display_name(row, limit=36)),
-                    int(row.get("scheduled_at") or 0) >= highlight_cutoff,
+            names: list[tuple[str, str | None]] = []
+
+            for row in rows:
+                event_id = row.get("event_id")
+                is_latest_event = (
+                    latest_event_id is not None
+                    and event_id is not None
+                    and int(event_id) == int(latest_event_id)
                 )
-                for row in rows
-            ]
+                is_recent = int(row.get("scheduled_at") or 0) >= highlight_cutoff
+
+                highlight: str | None = None
+                if is_latest_event:
+                    highlight = "latest_event"
+                elif is_recent:
+                    highlight = "recent"
+
+                names.append((
+                    code_safe(player_display_name(row, limit=36)),
+                    highlight,
+                ))
+
             content = highlighted_decoration_code_block(names)
         else:
             content = award_lines(
                 award_type=category,
                 awards=rows,
+                latest_event_id=latest_event_id,
             )
 
         intro = decoration_intro(category, len(rows))
@@ -1055,6 +1231,24 @@ def decorations_embed(*, since_ts: int, until_ts: int) -> discord.Embed:
             rolling_window_description(since_ts=since_ts, until_ts=until_ts)
             + "\nNo new awards or first-time op attenders in this window yet."
         )
+
+    legend_lines = [
+        (
+            f"Awards from last {recent_highlight_days()} days are "
+            f"{ANSI_RECENT_HIGHLIGHT}Blue{ANSI_RESET}"
+        ),
+    ]
+    if bool(LEADERBOARD_RECENT_HIGHLIGHT_EVENT):
+        legend_lines.append(
+            f"Awards from last op are "
+            f"{ANSI_LATEST_EVENT_HIGHLIGHT}Purple{ANSI_RESET}"
+        )
+
+    embed.add_field(
+        name="\u200b",
+        value=ansi_code_block(legend_lines),
+        inline=False,
+    )
 
     return embed
 

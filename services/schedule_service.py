@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from services.user_settings_service import safe_timezone_name
 from database import get_connection
 
 try:
@@ -308,9 +309,9 @@ def get_user_timezone(discord_id: str) -> str:
         ).fetchone()
 
     if row and row["timezone"]:
-        return str(row["timezone"])
+        return safe_timezone_name(str(row["timezone"]))
 
-    return str(SCHEDULE_DEFAULT_TIMEZONE or "America/New_York")
+    return safe_timezone_name(None)
 
 
 def get_op_templates(limit: int = 25, search_text: str = "") -> list[OpTemplateSummary]:
@@ -684,6 +685,7 @@ def create_op_event(
     scheduled_by: str,
     server_event_id: str | None = None,
     schedule_series_id: str | None = None,
+    allow_past: bool = False,
 ) -> int:
     ensure_schedule_schema()
 
@@ -692,7 +694,7 @@ def create_op_event(
     if template is None:
         raise ValueError("Selected op template does not exist.")
 
-    if int(scheduled_at) <= now_ts():
+    if int(scheduled_at) <= now_ts() and not allow_past:
         raise ValueError("Scheduled time must be in the future.")
 
     flights = get_flight_templates(op_template_id)

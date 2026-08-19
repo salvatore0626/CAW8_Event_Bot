@@ -71,6 +71,20 @@ def member_is_admin(member: discord.Member) -> bool:
     return member_has_any_role(member, admin_role_ids())
 
 
+def member_is_instructor(member: discord.Member) -> bool:
+    return member_has_any_role(member, instructor_role_ids())
+
+
+def member_can_receive_weekly_report(member: discord.Member) -> bool:
+    # Weekly Server Reports are intentionally limited to Admin and Instructor.
+    return member_is_admin(member) or member_is_instructor(member)
+
+
+def member_can_receive_operation_reminders(member: discord.Member) -> bool:
+    # OP Execution Reminders are intentionally limited to Admin and Mission Executer.
+    return member_is_admin(member) or member_has_any_role(member, mission_executer_role_ids())
+
+
 def member_is_mission_qualified(member: discord.Member) -> bool:
     return member_has_any_role(member, mission_qualified_role_ids())
 

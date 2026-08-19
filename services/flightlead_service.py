@@ -105,8 +105,12 @@ def get_upcoming_flightlead_events(
     days: int = 7,
     limit: int = 25,
 ) -> list[FlightLeadEventSummary]:
-    start_ts = now_ts()
-    end_ts = start_ts + (int(days) * 86400)
+    # Keep future reservations limited to the normal look-ahead window, but
+    # also include any event that is still Scheduled even if its scheduled
+    # time has already passed. This lets late-running ops continue accepting
+    # flight lead reservations until the op is actually opened/started.
+    current_ts = now_ts()
+    end_ts = current_ts + (int(days) * 86400)
 
     with get_connection() as conn:
         rows = conn.execute(
@@ -149,7 +153,6 @@ def get_upcoming_flightlead_events(
             LEFT JOIN op_reservations
                 ON op_reservations.op_event_id = op_events.event_id
             WHERE op_events.status = 'Scheduled'
-              AND op_events.scheduled_at >= ?
               AND op_events.scheduled_at <= ?
             GROUP BY
                 op_events.event_id,
@@ -158,13 +161,13 @@ def get_upcoming_flightlead_events(
                 op_templates.type,
                 op_events.scheduled_at,
                 op_events.status
-            ORDER BY op_events.scheduled_at ASC, op_events.event_id ASC
+            ORDER BY ABS(op_events.scheduled_at - ?) ASC, op_events.event_id ASC
             LIMIT ?
             """,
             (
                 str(discord_id),
-                int(start_ts),
                 int(end_ts),
+                int(current_ts),
                 int(limit),
             ),
         ).fetchall()
@@ -359,8 +362,8 @@ def count_user_reserved_slots_in_next_days(
     discord_id: str,
     days: int = 7,
 ) -> int:
-    start_ts = now_ts()
-    end_ts = start_ts + (int(days) * 86400)
+    current_ts = now_ts()
+    end_ts = current_ts + (int(days) * 86400)
 
     with get_connection() as conn:
         row = conn.execute(
@@ -372,12 +375,10 @@ def count_user_reserved_slots_in_next_days(
             WHERE op_reservations.reserved_by = ?
               AND op_reservations.status IN ('reserved', 'locked')
               AND op_events.status = 'Scheduled'
-              AND op_events.scheduled_at >= ?
               AND op_events.scheduled_at <= ?
             """,
             (
                 str(discord_id),
-                int(start_ts),
                 int(end_ts),
             ),
         ).fetchone()
@@ -393,8 +394,8 @@ def unreserve_all_user_slots_in_next_days(
     discord_id: str,
     days: int = 7,
 ) -> int:
-    start_ts = now_ts()
-    end_ts = start_ts + (int(days) * 86400)
+    current_ts = now_ts()
+    end_ts = current_ts + (int(days) * 86400)
 
     with get_connection() as conn:
         rows = conn.execute(
@@ -406,12 +407,10 @@ def unreserve_all_user_slots_in_next_days(
             WHERE op_reservations.reserved_by = ?
               AND op_reservations.status = 'reserved'
               AND op_events.status = 'Scheduled'
-              AND op_events.scheduled_at >= ?
               AND op_events.scheduled_at <= ?
             """,
             (
                 str(discord_id),
-                int(start_ts),
                 int(end_ts),
             ),
         ).fetchall()

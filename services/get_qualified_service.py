@@ -7,6 +7,8 @@ from typing import Optional
 import discord
 
 from config import MIN_VTOL_HOURS
+from services.user_settings_service import is_valid_timezone
+
 from database import get_connection
 
 
@@ -204,6 +206,8 @@ def update_user_timezone_setting(
 
     if not timezone:
         return
+    if not is_valid_timezone(timezone):
+        raise ValueError(f"Invalid IANA timezone: {timezone!r}")
 
     conn.execute(
         """

@@ -15,6 +15,10 @@ from services.reward_service import (
     manual_award_display_name,
     manual_award_type_key,
 )
+from services.qualification_record_service import (
+    FlightLeadReviewRecord,
+    flight_lead_reviews_for_user,
+)
 
 
 try:
@@ -54,9 +58,26 @@ class LookupSummary:
     manual_award_counts: dict[str, int]
     career_gpa: float | None
     career_gpa_attempts: int
+    flight_lead_rating_average: float | None
+    flight_lead_rating_count: int
+    flight_lead_reviews: list[FlightLeadReviewRecord]
+
+    @property
+    def flight_lead_rating_text(self) -> str:
+        count = max(0, int(self.flight_lead_rating_count))
+        noun = "review" if count == 1 else "reviews"
+
+        if self.flight_lead_rating_average is None or count == 0:
+            return f"☆☆☆☆☆ — ({count} {noun})"
+
+        average = max(0.0, min(5.0, float(self.flight_lead_rating_average)))
+        filled_stars = max(0, min(5, int(average + 0.5)))
+        stars = "★" * filled_stars + "☆" * (5 - filled_stars)
+        return f"{stars} {average:.1f} ({count} {noun})"
     attendance_position: int | None
     wire_gpa_position: int | None
     survival_position: int | None
+    recent_awards: list[dict[str, Any]]
 
 
 def clean_text(value: Any) -> str | None:
@@ -122,11 +143,71 @@ def manual_award_count_items(counts: dict[str, int]) -> list[tuple[str, int]]:
     return items
 
 
+def award_count_items(counts: dict[str, int]) -> list[tuple[str, int]]:
+    """Return all active award counts in stable display order.
+
+    Automatic awards are shown first. Configured manual awards follow in their
+    config order, then any future/unknown award types found in the database are
+    appended alphabetically so /lookup does not need code changes for new awards.
+    """
+    items: list[tuple[str, int]] = [
+        ("ACE", safe_int(counts.get("ACE", 0))),
+        ("Golden Wrench", safe_int(counts.get("GOLDEN_WRENCH", 0))),
+        ("Safety S", safe_int(counts.get("SAFETY_S", 0))),
+    ]
+    used = set(AUTOMATIC_AWARD_TYPES)
+
+    for award_name in configured_manual_awards():
+        key = manual_award_type_key(award_name)
+        if key in used:
+            continue
+        used.add(key)
+        items.append((award_name, safe_int(counts.get(key, 0))))
+
+    for award_type, count in sorted(counts.items()):
+        if award_type in used:
+            continue
+        used.add(award_type)
+        items.append((manual_award_display_name(award_type), safe_int(count)))
+
+    return items
+
+
 def manual_award_summary_lines(counts: dict[str, int]) -> list[str]:
+    # Backwards-compatible helper retained for callers outside /lookup.
     return [
         f"**{name}:** {count}"
         for name, count in manual_award_count_items(counts)
     ]
+
+
+def recent_active_awards(discord_id: str, limit: int = 5) -> list[dict[str, Any]]:
+    """Return newest active awards, linked to their source operation when possible."""
+    with get_connection() as conn:
+        if not table_exists(conn, "player_awards"):
+            return []
+        rows = conn.execute(
+            """
+            SELECT
+                pa.award_type,
+                pa.award_source,
+                pa.earned_at,
+                pa.source_event_id,
+                COALESCE(ot.name, 'Unknown Operation') AS operation_name
+            FROM player_awards pa
+            LEFT JOIN op_events oe
+                ON oe.event_id = pa.source_event_id
+            LEFT JOIN op_templates ot
+                ON ot.id = oe.op_template_id
+            WHERE pa.discord_id = ?
+              AND LOWER(COALESCE(pa.status, 'active')) = 'active'
+              AND pa.revoked_at IS NULL
+            ORDER BY COALESCE(pa.earned_at, 0) DESC, pa.award_id DESC
+            LIMIT ?
+            """,
+            (str(discord_id), max(1, int(limit))),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 def table_exists(conn, table_name: str) -> bool:
     row = conn.execute(
@@ -249,16 +330,25 @@ def normal_event_rows(discord_id: str) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
-def carrier_event_rows(discord_id: str) -> list[dict[str, Any]]:
-    """Event-level carrier records for the Safety S-style bolter streak."""
+def award_streak_event_rows(discord_id: str) -> list[dict[str, Any]]:
+    """Event rows that participate in Golden Wrench / Safety S streaks.
+
+    Keep this selection aligned with reward_service's automatic award rules:
+    completed Normal operations only; Arrested, Vertical, Airfield, and FTR
+    participate; all other landing types are ignored. FTR is retained because it
+    explicitly resets both streaks.
+    """
     with get_connection() as conn:
         rows = conn.execute(
             """
             SELECT
                 oe.event_id,
                 oe.scheduled_at,
-                MAX(CASE WHEN COALESCE(a.bolters, 0) > 0 THEN 1 ELSE 0 END)
-                    AS has_bolter
+                MAX(CASE WHEN COALESCE(a.combat_deaths, 0) > 0 THEN 1 ELSE 0 END)
+                    AS has_death,
+                MAX(COALESCE(a.bolters, 0)) AS bolters,
+                MAX(CASE WHEN a.landing_type = 'FTR' THEN 1 ELSE 0 END)
+                    AS has_ftr
             FROM attendance a
             JOIN op_events oe
                 ON oe.event_id = a.scheduled_op_id
@@ -268,8 +358,7 @@ def carrier_event_rows(discord_id: str) -> list[dict[str, Any]]:
               AND oe.status = 'Complete'
               AND ot.type = 'Normal'
               AND a.status IN ('submitted', 'complete')
-              AND a.landing_type = 'Arrested'
-              AND a.bolters IS NOT NULL
+              AND a.landing_type IN ('Arrested', 'Vertical', 'Airfield', 'FTR')
             GROUP BY oe.event_id, oe.scheduled_at
             ORDER BY oe.scheduled_at ASC, oe.event_id ASC
             """,
@@ -279,16 +368,26 @@ def carrier_event_rows(discord_id: str) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
-def clean_streak(rows: list[dict[str, Any]], failure_key: str) -> tuple[int, int]:
+def award_style_streak(
+    rows: list[dict[str, Any]],
+    failure_key: str,
+) -> tuple[int, int]:
+    """Return current streak and clean-op total using automatic award rules."""
     total = 0
     current = 0
 
     for row in rows:
-        if safe_int(row.get(failure_key)) == 0:
-            total += 1
-            current += 1
-        else:
+        failed = (
+            safe_int(row.get(failure_key)) > 0
+            or safe_int(row.get("has_ftr")) > 0
+        )
+
+        if failed:
             current = 0
+            continue
+
+        total += 1
+        current += 1
 
     return current, total
 
@@ -321,7 +420,7 @@ def career_gpa(discord_id: str) -> tuple[float | None, int]:
               AND oe.status = 'Complete'
               AND ot.type = 'Normal'
               AND a.status IN ('submitted', 'complete')
-              AND a.landing_type = 'Arrested'
+              AND a.landing_type IN ('Arrested', 'FTR')
               AND (
                     a.wires BETWEEN 1 AND 4
                  OR COALESCE(a.bolters, 0) > 0
@@ -505,7 +604,7 @@ def global_gpa_rows() -> list[dict[str, Any]]:
               AND ot.type = 'Normal'
               AND a.status IN ('submitted', 'complete')
               AND a.discord_id IS NOT NULL
-              AND a.landing_type = 'Arrested'
+              AND a.landing_type IN ('Arrested', 'FTR')
               AND (
                     a.wires BETWEEN 1 AND 4
                  OR COALESCE(a.bolters, 0) > 0
@@ -555,14 +654,29 @@ def build_lookup_summary(
         fallback_name=fallback_name,
     )
     events = normal_event_rows(str(discord_id))
-    carrier_events = carrier_event_rows(str(discord_id))
-    deathless_current, deathless_total = clean_streak(events, "has_death")
-    bolterless_current, bolterless_total = clean_streak(
-        carrier_events,
-        "has_bolter",
+    award_events = award_streak_event_rows(str(discord_id))
+    deathless_current, deathless_total = award_style_streak(
+        award_events,
+        "has_death",
+    )
+    bolterless_current, bolterless_total = award_style_streak(
+        award_events,
+        "bolters",
     )
     awards = active_award_counts(str(discord_id))
     gpa, attempts = career_gpa(str(discord_id))
+    flight_lead_reviews = flight_lead_reviews_for_user(str(discord_id))
+    flight_lead_ratings = [
+        safe_int(review.flight_lead_rating)
+        for review in flight_lead_reviews
+        if review.flight_lead_rating is not None
+    ]
+    flight_lead_rating_count = len(flight_lead_ratings)
+    flight_lead_rating_average = (
+        sum(flight_lead_ratings) / flight_lead_rating_count
+        if flight_lead_rating_count
+        else None
+    )
 
     unique_ops = {
         compact_text(row.get("op_name")).casefold()
@@ -591,6 +705,9 @@ def build_lookup_summary(
         manual_award_counts=awards,
         career_gpa=gpa,
         career_gpa_attempts=attempts,
+        flight_lead_rating_average=flight_lead_rating_average,
+        flight_lead_rating_count=flight_lead_rating_count,
+        flight_lead_reviews=flight_lead_reviews,
         attendance_position=lookup_position(
             global_attendance_rows(),
             str(discord_id),
@@ -603,6 +720,7 @@ def build_lookup_summary(
             global_survival_rows(),
             str(discord_id),
         ),
+        recent_awards=recent_active_awards(str(discord_id), limit=5),
     )
 
 
@@ -656,6 +774,8 @@ def award_export_rows(discord_id: str) -> list[dict[str, Any]]:
             LEFT JOIN op_templates ot
                 ON ot.id = oe.op_template_id
             WHERE pa.discord_id = ?
+              AND LOWER(COALESCE(pa.status, 'active')) = 'active'
+              AND pa.revoked_at IS NULL
             ORDER BY pa.earned_at ASC, pa.award_id ASC
             """,
             (str(discord_id),),
@@ -707,6 +827,7 @@ def build_lookup_export(
             else "Career Wire GPA: —"
         ),
         f"Career GPA Attempts: {summary.career_gpa_attempts}",
+        f"Flight lead rating: {summary.flight_lead_rating_text}",
         (
             "Leaderboard Positions: "
             f"Attendance {summary.attendance_position or '—'} | "
@@ -716,61 +837,27 @@ def build_lookup_export(
         "",
         "ACTIVE AWARD COUNTS",
         "-" * 78,
-        f"ACE: {summary.ace_awards}",
-        f"Golden Wrench: {summary.golden_wrench_awards}",
-        f"Safety S: {summary.safety_s_awards}",
         *[
             f"{name}: {count}"
-            for name, count in manual_award_count_items(summary.manual_award_counts)
+            for name, count in award_count_items(summary.manual_award_counts)
         ],
         "",
-        f"AWARD HISTORY ({len(awards)})",
+        f"ATTENDANCE & ACTIVE AWARD HISTORY ({len(attendance)} attendance records)",
         "-" * 78,
+        (
+            "Columns: Date | Event | Operation [Type/Status] | Slot | "
+            "Aircraft | Landing | Wires | Bolters | Deaths | Source"
+        ),
     ]
 
-    if awards:
-        for award in awards:
-            event_label = (
-                f"#{award['source_event_id']} "
-                f"{format_nullable(award.get('operation_name'))}"
-                if award.get("source_event_id") is not None
-                else "No linked operation"
-            )
-            lines.extend(
-                [
-                    (
-                        f"[{format_nullable(award.get('status')).upper()}] "
-                        f"{manual_award_display_name(award.get('award_type'), award.get('details_json'))} | "
-                        f"Earned {timestamp_text(award.get('earned_at'))} | "
-                        f"{event_label} | "
-                        f"Source: {format_nullable(award.get('award_source'))}"
-                    ),
-                ]
-            )
-
-            if clean_text(award.get("notes")):
-                lines.append(f"  Notes: {compact_text(award.get('notes'))}")
-
-            if award.get("revoked_at"):
-                lines.append(
-                    f"  Revoked: {timestamp_text(award.get('revoked_at'))}"
-                )
-
-            lines.append("")
-    else:
-        lines.append("No award history recorded.")
-        lines.append("")
-
-    lines.extend(
-        [
-            f"ATTENDANCE HISTORY ({len(attendance)})",
-            "-" * 78,
-            (
-                "Columns: Date | Event | Operation [Type/Status] | Slot | "
-                "Aircraft | Landing | Wires | Bolters | Deaths | Source"
-            ),
-        ]
-    )
+    awards_by_event: dict[int, list[dict[str, Any]]] = {}
+    unlinked_awards: list[dict[str, Any]] = []
+    for award in awards:
+        event_id = award.get("source_event_id")
+        if event_id is None:
+            unlinked_awards.append(award)
+            continue
+        awards_by_event.setdefault(int(event_id), []).append(award)
 
     if attendance:
         for row in attendance:
@@ -814,8 +901,61 @@ def build_lookup_export(
             for label, value in notes:
                 if clean_text(value):
                     lines.append(f"  {label}: {compact_text(value)}")
+
+            event_id = row.get("event_id")
+            if event_id is not None:
+                for award in awards_by_event.pop(int(event_id), []):
+                    lines.append(
+                        "  Award earned: "
+                        f"{manual_award_display_name(award.get('award_type'), award.get('details_json'))} "
+                        f"| Source: {format_nullable(award.get('award_source'))}"
+                    )
+                    if clean_text(award.get("notes")):
+                        lines.append(f"    Award notes: {compact_text(award.get('notes'))}")
     else:
         lines.append("No attendance records found for this Discord ID.")
+
+    remaining_awards = [
+        award
+        for event_awards in awards_by_event.values()
+        for award in event_awards
+    ] + unlinked_awards
+
+    if remaining_awards:
+        lines.extend(["", "ACTIVE AWARDS WITHOUT A MATCHING ATTENDANCE ROW", "-" * 78])
+        for award in remaining_awards:
+            event_label = (
+                f"Event #{award['source_event_id']}"
+                if award.get("source_event_id") is not None
+                else "No linked event"
+            )
+            lines.append(
+                f"{manual_award_display_name(award.get('award_type'), award.get('details_json'))} | "
+                f"Earned {timestamp_text(award.get('earned_at'))} | {event_label} | "
+                f"Source: {format_nullable(award.get('award_source'))}"
+            )
+            if clean_text(award.get("notes")):
+                lines.append(f"  Notes: {compact_text(award.get('notes'))}")
+
+    written_flight_lead_reviews = [
+        (review, compact_text(review.fl_remarks))
+        for review in summary.flight_lead_reviews
+        if compact_text(review.fl_remarks)
+    ]
+
+    lines.extend(
+        [
+            "",
+            f"FLIGHT LEAD REVIEWS ({len(written_flight_lead_reviews)})",
+            "-" * 78,
+        ]
+    )
+
+    if written_flight_lead_reviews:
+        for review, review_text in written_flight_lead_reviews:
+            lines.append(f"Review Entry #{review.entry_id}: {review_text}")
+    else:
+        lines.append("No written flight lead reviews found.")
 
     lines.extend(
         [

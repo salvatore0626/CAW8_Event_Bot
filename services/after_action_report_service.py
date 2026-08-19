@@ -10,12 +10,6 @@ from database import get_connection
 from services.wire_gpa_service import bolter_score, wire_score
 
 
-try:
-    from config import SCHEDULE_DEFAULT_TIMEZONE
-except ImportError:
-    SCHEDULE_DEFAULT_TIMEZONE = "America/New_York"
-
-
 @dataclass(frozen=True)
 class AfterActionEvent:
     event_id: int
@@ -338,10 +332,10 @@ def compute_operation_gpa(attendance: list[AfterActionAttendance]) -> tuple[floa
 
     for row in attendance:
         landing = (row.landing_type or "").strip().lower()
-        if landing != "arrested":
+        if landing not in {"arrested", "ftr"}:
             continue
 
-        if row.wires is not None:
+        if landing == "arrested" and row.wires is not None:
             score = wire_score(row.wires)
             if score is not None:
                 points += float(score)
@@ -405,18 +399,21 @@ def autocomplete_op_template_names(current: str, limit: int = 25) -> list[str]:
     return [str(row["name"]) for row in rows if row["name"]]
 
 
-def configured_timezone() -> ZoneInfo:
+def configured_timezone(timezone_name: str | None = None) -> ZoneInfo:
     try:
-        return ZoneInfo(str(SCHEDULE_DEFAULT_TIMEZONE or "America/New_York"))
+        return ZoneInfo(str(timezone_name or "America/Chicago"))
     except Exception:
-        return ZoneInfo("America/New_York")
+        return ZoneInfo("America/Chicago")
 
 
-def format_event_datetime(timestamp: int | None) -> str:
+def format_event_datetime(
+    timestamp: int | None,
+    timezone_name: str | None = None,
+) -> str:
     if not timestamp:
         return "Unknown"
 
-    dt = datetime.fromtimestamp(int(timestamp), tz=configured_timezone())
+    dt = datetime.fromtimestamp(int(timestamp), tz=configured_timezone(timezone_name))
     hour = dt.hour % 12 or 12
     ampm = "am" if dt.hour < 12 else "pm"
 
@@ -425,11 +422,14 @@ def format_event_datetime(timestamp: int | None) -> str:
 
 
 
-def format_event_select_datetime(timestamp: int | None) -> str:
+def format_event_select_datetime(
+    timestamp: int | None,
+    timezone_name: str | None = None,
+) -> str:
     if not timestamp:
         return "Unknown"
 
-    dt = datetime.fromtimestamp(int(timestamp), tz=configured_timezone())
+    dt = datetime.fromtimestamp(int(timestamp), tz=configured_timezone(timezone_name))
     hour = dt.hour % 12 or 12
     ampm = "am" if dt.hour < 12 else "pm"
 
@@ -440,7 +440,7 @@ def relative_time(timestamp: int | None) -> str:
     if not timestamp:
         return "unknown"
 
-    now = int(datetime.now(tz=configured_timezone()).timestamp())
+    now = int(datetime.now().timestamp())
     delta = now - int(timestamp)
 
     future = delta < 0

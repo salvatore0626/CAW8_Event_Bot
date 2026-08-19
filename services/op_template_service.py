@@ -5,13 +5,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from database import get_connection
+from services.wire_gpa_service import bolter_score, wire_score
 
 try:
     from config import AIRCRAFT_OPTIONS
 except ImportError:
     AIRCRAFT_OPTIONS = [
         {"name": "AV-42C", "max_seats": 1},
-        {"name": "F/A-26", "max_seats": 1},
+        {"name": "F/A-26B", "max_seats": 1},
         {"name": "F-45A", "max_seats": 1},
         {"name": "EF-24", "max_seats": 2},
         {"name": "T-55", "max_seats": 2},
@@ -51,6 +52,17 @@ class OpTemplateRow:
     creator: str | None
     creator_display_name: str | None
     completed_event_ids: list[int]
+    gpa_average: float | None = None
+    gpa_attempts: int = 0
+    remarks_count: int = 0
+
+
+@dataclass(frozen=True)
+class OpTemplateRemark:
+    entry_id: int
+    timestamp: int | None
+    user_name: str
+    remarks: str
 
 
 @dataclass
@@ -142,6 +154,81 @@ def completed_event_ids_for_template(conn, template_id: int) -> list[int]:
     ]
 
 
+def normalize_template_key(value: str | None) -> str:
+    return (clean_text(value) or "").casefold()
+
+
+def attendance_stats_by_template(conn) -> dict[str, dict[str, float | int]]:
+    """Return GPA/remark stats keyed by the historical attendance template name.
+
+    GPA follows the same carrier-attempt rules used by the after-action report:
+    an arrested wire is one scored attempt and each bolter is an additional
+    zero-point attempt. FTR rows can contribute bolter attempts but not wires.
+    """
+    rows = conn.execute(
+        """
+        SELECT
+            op_template_name,
+            landing_type,
+            wires,
+            bolters,
+            op_remarks
+        FROM attendance
+        WHERE COALESCE(status, '') NOT IN ('deleted', 'reset')
+        """
+    ).fetchall()
+
+    stats: dict[str, dict[str, float | int]] = {}
+
+    for row in rows:
+        key = normalize_template_key(row["op_template_name"])
+        if not key:
+            continue
+
+        bucket = stats.setdefault(
+            key,
+            {"points": 0.0, "attempts": 0, "remarks_count": 0},
+        )
+
+        if clean_text(row["op_remarks"]):
+            bucket["remarks_count"] = int(bucket["remarks_count"]) + 1
+
+        landing = (clean_text(row["landing_type"]) or "").casefold()
+        if landing not in {"arrested", "ftr"}:
+            continue
+
+        if landing == "arrested" and row["wires"] is not None:
+            score = wire_score(row["wires"])
+            if score is not None:
+                bucket["points"] = float(bucket["points"]) + float(score)
+                bucket["attempts"] = int(bucket["attempts"]) + 1
+
+        try:
+            bolters = max(0, int(row["bolters"] or 0))
+        except (TypeError, ValueError):
+            bolters = 0
+
+        if bolters:
+            bucket["points"] = (
+                float(bucket["points"]) + bolters * float(bolter_score())
+            )
+            bucket["attempts"] = int(bucket["attempts"]) + bolters
+
+    return stats
+
+
+def template_stats_from_map(
+    stats: dict[str, dict[str, float | int]],
+    template_name: str,
+) -> tuple[float | None, int, int]:
+    bucket = stats.get(normalize_template_key(template_name), {})
+    attempts = int(bucket.get("attempts", 0) or 0)
+    points = float(bucket.get("points", 0.0) or 0.0)
+    remarks_count = int(bucket.get("remarks_count", 0) or 0)
+    gpa_average = (points / attempts) if attempts else None
+    return gpa_average, attempts, remarks_count
+
+
 def creator_display_name_from_id(conn, creator: str | None) -> str | None:
     creator_id = clean_text(creator)
 
@@ -196,13 +283,19 @@ def list_op_templates() -> list[OpTemplateRow]:
         ).fetchall()
 
         result: list[OpTemplateRow] = []
+        attendance_stats = attendance_stats_by_template(conn)
 
         for row in rows:
             creator = clean_text(row["creator"])
+            name = str(row["name"])
+            gpa_average, gpa_attempts, remarks_count = template_stats_from_map(
+                attendance_stats,
+                name,
+            )
             result.append(
                 OpTemplateRow(
                     id=int(row["id"]),
-                    name=str(row["name"]),
+                    name=name,
                     total_players=int(row["total_players"] or 0),
                     flight_count=int(row["flight_count"] or 0),
                     runtime_count=int(row["runtime_count"] or 0),
@@ -211,6 +304,9 @@ def list_op_templates() -> list[OpTemplateRow]:
                     creator=creator,
                     creator_display_name=creator_display_name_from_id(conn, creator),
                     completed_event_ids=completed_event_ids_for_template(conn, int(row["id"])),
+                    gpa_average=gpa_average,
+                    gpa_attempts=gpa_attempts,
+                    remarks_count=remarks_count,
                 )
             )
 
@@ -245,10 +341,16 @@ def get_template_row(template_id: int) -> OpTemplateRow | None:
             return None
 
         creator = clean_text(row["creator"])
+        name = str(row["name"])
+        attendance_stats = attendance_stats_by_template(conn)
+        gpa_average, gpa_attempts, remarks_count = template_stats_from_map(
+            attendance_stats,
+            name,
+        )
 
         return OpTemplateRow(
             id=int(row["id"]),
-            name=str(row["name"]),
+            name=name,
             total_players=int(row["total_players"] or 0),
             flight_count=int(row["flight_count"] or 0),
             runtime_count=int(row["runtime_count"] or 0),
@@ -257,7 +359,90 @@ def get_template_row(template_id: int) -> OpTemplateRow | None:
             creator=creator,
             creator_display_name=creator_display_name_from_id(conn, creator),
             completed_event_ids=completed_event_ids_for_template(conn, int(row["id"])),
+            gpa_average=gpa_average,
+            gpa_attempts=gpa_attempts,
+            remarks_count=remarks_count,
         )
+
+
+def search_op_template_choices(
+    current: str | None,
+    limit: int = 25,
+) -> list[tuple[int, str]]:
+    query = clean_text(current) or ""
+    safe_limit = max(1, min(25, int(limit)))
+
+    with get_connection() as conn:
+        if query:
+            rows = conn.execute(
+                """
+                SELECT id, name
+                FROM op_templates
+                WHERE LOWER(name) LIKE LOWER(?)
+                   OR CAST(id AS TEXT) LIKE ?
+                ORDER BY name COLLATE NOCASE ASC, id DESC
+                LIMIT ?
+                """,
+                (f"%{query}%", f"%{query}%", safe_limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT id, name
+                FROM op_templates
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (safe_limit,),
+            ).fetchall()
+
+    return [(int(row["id"]), str(row["name"])) for row in rows]
+
+
+def list_template_remarks(template_name: str) -> list[OpTemplateRemark]:
+    wanted = clean_text(template_name)
+    if not wanted:
+        return []
+
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                a.entry_id,
+                COALESCE(oe.scheduled_at, a.logged_at, a.created_at, a.updated_at) AS remark_time,
+                COALESCE(
+                    NULLIF(TRIM(u.display_name), ''),
+                    NULLIF(TRIM(u.discord_username), ''),
+                    NULLIF(TRIM(a.user_name), ''),
+                    NULLIF(TRIM(a.discord_id), ''),
+                    'Unknown User'
+                ) AS user_name,
+                a.op_remarks
+            FROM attendance a
+            LEFT JOIN users u
+                ON u.discord_id = a.discord_id
+            LEFT JOIN op_events oe
+                ON oe.event_id = a.scheduled_op_id
+            WHERE LOWER(TRIM(COALESCE(a.op_template_name, ''))) = LOWER(TRIM(?))
+              AND TRIM(COALESCE(a.op_remarks, '')) <> ''
+              AND COALESCE(a.status, '') NOT IN ('deleted', 'reset')
+            ORDER BY
+                COALESCE(oe.scheduled_at, a.logged_at, a.created_at, a.updated_at, 0) DESC,
+                a.entry_id DESC
+            """,
+            (wanted,),
+        ).fetchall()
+
+    return [
+        OpTemplateRemark(
+            entry_id=int(row["entry_id"]),
+            timestamp=int(row["remark_time"]) if row["remark_time"] is not None else None,
+            user_name=str(row["user_name"] or "Unknown User"),
+            remarks=str(row["op_remarks"] or "").strip(),
+        )
+        for row in rows
+        if clean_text(row["op_remarks"])
+    ]
 
 
 def load_edit_draft(template_id: int) -> OpTemplateEditDraft | None:

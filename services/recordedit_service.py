@@ -526,7 +526,7 @@ def flight_for_slot(event_id: int, slot: str | None) -> FlightTemplate | None:
     return None
 
 
-PILOT_LANDING_TYPES = {"Arrested", "Airfield", "Vertical"}
+PILOT_LANDING_TYPES = {"Arrested", "Airfield", "Vertical", "FTR"}
 NON_PILOT_COMPATIBLE_LANDING_TYPES = {"Non-Pilot", "DNF"}
 
 
@@ -592,10 +592,15 @@ def validate_records(event_id: int) -> RecordValidation:
 
         if record.landing_type == "Arrested":
             if record.wires is None:
-                add_record_warning(record_warnings, record, "Arrested landing is missing wire.")
-
+                add_record_warning(record_warnings, record, "Arrested record is missing wire.")
             if record.bolters is None:
-                add_record_warning(record_warnings, record, "Arrested landing is missing bolters.")
+                add_record_warning(record_warnings, record, "Arrested record is missing bolters.")
+
+        if record.landing_type == "FTR":
+            if record.wires is not None:
+                add_record_warning(record_warnings, record, "FTR record must use N/A for wire.")
+            if record.bolters is None:
+                add_record_warning(record_warnings, record, "FTR record is missing bolters.")
 
         if record.slot and record.slot not in slot_to_flight:
             add_record_warning(record_warnings, record, f"Slot `{record.slot}` does not match this op template.")
@@ -791,6 +796,30 @@ def update_attendance_record(
     ts = now_ts()
     did = clean_text(discord_id)
     resolved_user_name = username_for_discord_id(did)
+
+    landing = clean_text(landing_type)
+    allowed_landings = {"Arrested", "FTR", "Airfield", "Vertical", "Non-Pilot", "DNF"}
+    if landing not in allowed_landings:
+        raise ValueError("Invalid landing type.")
+
+    if combat_deaths is None or not 0 <= int(combat_deaths) <= 24:
+        raise ValueError("Combat deaths must be selected from 0 to 24.")
+
+    if landing == "Arrested":
+        if wires is None or not 0 <= int(wires) <= 4:
+            raise ValueError("Arrested records require a wire value from 0 to 4.")
+        if bolters is None or not 0 <= int(bolters) <= 24:
+            raise ValueError("Arrested records require bolters from 0 to 24.")
+    elif landing == "FTR":
+        if wires is not None:
+            raise ValueError("FTR records must use N/A for wire.")
+        if bolters is None or not 0 <= int(bolters) <= 24:
+            raise ValueError("FTR records require bolters from 0 to 24.")
+    elif wires is not None or bolters is not None:
+        raise ValueError(f"{landing} records cannot include wire or bolter values.")
+
+    if landing in {"Non-Pilot", "DNF"} and int(combat_deaths) != 0:
+        raise ValueError(f"{landing} records must use 0 combat deaths.")
 
     with get_connection() as conn:
         before_record = fetch_attendance_record_in_conn(conn, int(entry_id))

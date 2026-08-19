@@ -58,7 +58,11 @@ def sync_member_to_users_table(member: discord.Member) -> None:
     )
 
 
-async def sync_guild_users(guild: discord.Guild) -> None:
+async def sync_guild_users(
+    guild: discord.Guild,
+    *,
+    performed_by_id: str | int | None = None,
+) -> None:
     """
     Runs on bot startup.
     Updates every non-bot member in the users table.
@@ -73,4 +77,7 @@ async def sync_guild_users(guild: discord.Guild) -> None:
         current_member_ids.add(str(member.id))
         sync_member_to_users_table(member)
 
-    mark_users_not_in_server_as_mia(current_member_ids)
+    mark_users_not_in_server_as_mia(
+        current_member_ids,
+        performed_by_id=performed_by_id,
+    )

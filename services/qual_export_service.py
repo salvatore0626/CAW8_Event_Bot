@@ -523,3 +523,715 @@ def create_qual_export_file() -> Path:
     path.write_bytes(build_qual_export_xlsx_bytes())
 
     return path
+
+
+# ---------------------------------------------------------------------------
+# Expanded /fax exports
+# ---------------------------------------------------------------------------
+
+import sqlite3
+from collections import defaultdict
+from zoneinfo import ZoneInfo
+
+
+STYLE_SECTION = 8
+
+
+def clean_multiline_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def normalized_epoch_seconds(value: Any) -> int | None:
+    timestamp = int_or_none(value)
+    if timestamp is None:
+        return None
+
+    # Legacy imports may contain JavaScript millisecond timestamps.
+    if timestamp > 10_000_000_000:
+        timestamp //= 1000
+
+    return timestamp
+
+
+def format_utc_timestamp(value: Any) -> str:
+    timestamp = normalized_epoch_seconds(value)
+    if timestamp is None:
+        return ""
+
+    try:
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime(
+            "%Y-%m-%d %H:%M UTC"
+        )
+    except (OverflowError, OSError, ValueError):
+        return ""
+
+
+def central_timestamp_for_filename() -> str:
+    try:
+        zone = ZoneInfo("America/Chicago")
+    except Exception:
+        zone = timezone.utc
+
+    return datetime.now(zone).strftime("%Y-%m-%d_%H%M%S_%Z")
+
+
+def export_directory() -> Path:
+    path = Path(tempfile.gettempdir()) / "airboss_fax_exports"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def safe_sheet_name(value: str, used_names: set[str]) -> str:
+    name = re.sub(r"[\\/*?:\[\]]", "_", str(value or "Sheet")).strip() or "Sheet"
+    name = name[:31]
+    candidate = name
+    suffix = 2
+
+    while candidate.casefold() in used_names:
+        suffix_text = f" ({suffix})"
+        candidate = f"{name[:31 - len(suffix_text)]}{suffix_text}"
+        suffix += 1
+
+    used_names.add(candidate.casefold())
+    return candidate
+
+
+def generic_worksheet_xml(
+    *,
+    headers: list[str],
+    rows: list[list[tuple[Any, int]]],
+    widths: list[float],
+    auto_filter: bool = True,
+) -> str:
+    max_cols = max(1, len(headers))
+    max_rows = max(1, len(rows) + 1)
+    last_col = column_letter(max_cols)
+    dimension = f"A1:{last_col}{max_rows}"
+
+    normalized_widths = list(widths[:max_cols])
+    while len(normalized_widths) < max_cols:
+        normalized_widths.append(18)
+
+    col_xml = "".join(
+        f'<col min="{index}" max="{index}" width="{width}" customWidth="1"/>'
+        for index, width in enumerate(normalized_widths, start=1)
+    )
+
+    row_xml_parts = [
+        row_cells_xml(1, [(header, STYLE_HEADER) for header in headers])
+    ]
+
+    for row_index, row in enumerate(rows, start=2):
+        normalized_row = list(row[:max_cols])
+        while len(normalized_row) < max_cols:
+            normalized_row.append(("", STYLE_WRAP))
+        row_xml_parts.append(row_cells_xml(row_index, normalized_row))
+
+    auto_filter_xml = (
+        f'<autoFilter ref="A1:{last_col}{max_rows}"/>' if auto_filter else ""
+    )
+
+    return f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+    <dimension ref="{dimension}"/>
+    <sheetViews>
+        <sheetView workbookViewId="0">
+            <pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>
+            <selection pane="bottomLeft"/>
+        </sheetView>
+    </sheetViews>
+    <cols>{col_xml}</cols>
+    <sheetData>{''.join(row_xml_parts)}</sheetData>
+    {auto_filter_xml}
+</worksheet>
+'''
+
+
+def generic_content_types_xml(sheet_count: int) -> str:
+    worksheet_overrides = "".join(
+        f'<Override PartName="/xl/worksheets/sheet{index}.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        for index in range(1, sheet_count + 1)
+    )
+
+    return f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+    <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+    <Default Extension="xml" ContentType="application/xml"/>
+    <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+    {worksheet_overrides}
+    <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+</Types>
+'''
+
+
+def generic_workbook_xml(sheet_names: list[str]) -> str:
+    sheet_xml = "".join(
+        f'<sheet name="{html.escape(name, quote=True)}" sheetId="{index}" r:id="rId{index}"/>'
+        for index, name in enumerate(sheet_names, start=1)
+    )
+
+    return f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+    <sheets>{sheet_xml}</sheets>
+</workbook>
+'''
+
+
+def generic_workbook_rels_xml(sheet_count: int) -> str:
+    relationships = "".join(
+        f'<Relationship Id="rId{index}" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+        f'Target="worksheets/sheet{index}.xml"/>'
+        for index in range(1, sheet_count + 1)
+    )
+    style_id = sheet_count + 1
+
+    return f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+    {relationships}
+    <Relationship Id="rId{style_id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>
+'''
+
+
+def expanded_styles_xml() -> str:
+    # 0 normal, 1 header, 2 wrapped, 3 white/NA, 4 red, 5 orange,
+    # 6 yellow, 7 green, 8 section header.
+    return '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+    <fonts count="3">
+        <font><sz val="11"/><color rgb="FF111827"/><name val="Calibri"/><family val="2"/></font>
+        <font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/><family val="2"/></font>
+        <font><b/><sz val="11"/><color rgb="FF111827"/><name val="Calibri"/><family val="2"/></font>
+    </fonts>
+    <fills count="9">
+        <fill><patternFill patternType="none"/></fill>
+        <fill><patternFill patternType="gray125"/></fill>
+        <fill><patternFill patternType="solid"><fgColor rgb="FF1F2937"/><bgColor indexed="64"/></patternFill></fill>
+        <fill><patternFill patternType="solid"><fgColor rgb="FFFFFFFF"/><bgColor indexed="64"/></patternFill></fill>
+        <fill><patternFill patternType="solid"><fgColor rgb="FFF87171"/><bgColor indexed="64"/></patternFill></fill>
+        <fill><patternFill patternType="solid"><fgColor rgb="FFFBBF24"/><bgColor indexed="64"/></patternFill></fill>
+        <fill><patternFill patternType="solid"><fgColor rgb="FFFEF08A"/><bgColor indexed="64"/></patternFill></fill>
+        <fill><patternFill patternType="solid"><fgColor rgb="FF86EFAC"/><bgColor indexed="64"/></patternFill></fill>
+        <fill><patternFill patternType="solid"><fgColor rgb="FFD1D5DB"/><bgColor indexed="64"/></patternFill></fill>
+    </fills>
+    <borders count="2">
+        <border><left/><right/><top/><bottom/><diagonal/></border>
+        <border>
+            <left style="thin"><color rgb="FFD1D5DB"/></left>
+            <right style="thin"><color rgb="FFD1D5DB"/></right>
+            <top style="thin"><color rgb="FFD1D5DB"/></top>
+            <bottom style="thin"><color rgb="FFD1D5DB"/></bottom>
+            <diagonal/>
+        </border>
+    </borders>
+    <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+    <cellXfs count="9">
+        <xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
+        <xf numFmtId="0" fontId="1" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>
+        <xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>
+        <xf numFmtId="0" fontId="0" fillId="3" borderId="1" xfId="0" applyFill="1" applyBorder="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>
+        <xf numFmtId="0" fontId="0" fillId="4" borderId="1" xfId="0" applyFill="1" applyBorder="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>
+        <xf numFmtId="0" fontId="0" fillId="5" borderId="1" xfId="0" applyFill="1" applyBorder="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>
+        <xf numFmtId="0" fontId="0" fillId="6" borderId="1" xfId="0" applyFill="1" applyBorder="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>
+        <xf numFmtId="0" fontId="0" fillId="7" borderId="1" xfId="0" applyFill="1" applyBorder="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>
+        <xf numFmtId="0" fontId="2" fillId="8" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>
+    </cellXfs>
+    <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
+    <dxfs count="0"/>
+    <tableStyles count="0" defaultTableStyle="TableStyleMedium2" defaultPivotStyle="PivotStyleLight16"/>
+</styleSheet>
+'''
+
+
+def build_generic_workbook_bytes(sheets: list[dict[str, Any]]) -> bytes:
+    if not sheets:
+        raise ValueError("At least one worksheet is required.")
+
+    used_names: set[str] = set()
+    sheet_names = [safe_sheet_name(sheet["name"], used_names) for sheet in sheets]
+    buffer = io.BytesIO()
+
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            generic_content_types_xml(len(sheets)),
+        )
+        archive.writestr("_rels/.rels", root_rels_xml())
+        archive.writestr("xl/workbook.xml", generic_workbook_xml(sheet_names))
+        archive.writestr(
+            "xl/_rels/workbook.xml.rels",
+            generic_workbook_rels_xml(len(sheets)),
+        )
+        archive.writestr("xl/styles.xml", expanded_styles_xml())
+
+        for index, sheet in enumerate(sheets, start=1):
+            archive.writestr(
+                f"xl/worksheets/sheet{index}.xml",
+                generic_worksheet_xml(
+                    headers=list(sheet["headers"]),
+                    rows=list(sheet["rows"]),
+                    widths=list(sheet["widths"]),
+                    auto_filter=bool(sheet.get("auto_filter", True)),
+                ),
+            )
+
+    return buffer.getvalue()
+
+
+def operation_review_rows() -> list[dict[str, Any]]:
+    """Return anonymous operation remarks grouped by attendance template name."""
+    with get_connection() as conn:
+        if not table_exists(conn, "attendance"):
+            return []
+
+        rows = conn.execute(
+            """
+            SELECT
+                a.entry_id,
+                COALESCE(
+                    NULLIF(TRIM(a.op_template_name), ''),
+                    'Unknown Operation'
+                ) AS operation_template,
+                a.op_remarks
+            FROM attendance a
+            WHERE NULLIF(TRIM(a.op_remarks), '') IS NOT NULL
+            ORDER BY
+                operation_template COLLATE NOCASE ASC,
+                a.entry_id ASC
+            """
+        ).fetchall()
+
+    return [
+        {
+            "operation_template": clean_text(row["operation_template"]) or "Unknown Operation",
+            "entry_id": int(row["entry_id"]),
+            "review": clean_multiline_text(row["op_remarks"]),
+        }
+        for row in rows
+    ]
+
+
+def indent_multiline(value: str, prefix: str = "    ") -> str:
+    lines = str(value).splitlines() or [""]
+    return ("\n" + prefix).join(lines)
+
+
+def build_operation_reviews_export_text() -> str:
+    reviews = operation_review_rows()
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
+    for review in reviews:
+        grouped[review["operation_template"]].append(review)
+
+    parts: list[str] = []
+
+    for template_name in sorted(grouped, key=str.casefold):
+        template_reviews = grouped[template_name]
+        count = len(template_reviews)
+        heading = f"Operation {template_name} ({count} Remarks)"
+
+        parts.append(heading)
+        parts.append("=" * len(heading))
+
+        for index, review in enumerate(template_reviews, start=1):
+            parts.append(f"Remark {index}:")
+            parts.append(indent_multiline(review["review"]))
+            parts.append("")
+
+        parts.append("")
+
+    if not parts:
+        return "No operation remarks were found.\n"
+
+    return "\n".join(parts).rstrip() + "\n"
+
+
+def create_operation_reviews_export_file() -> Path:
+    path = export_directory() / f"operation_reviews_{zulu_timestamp_for_filename()}.txt"
+    path.write_text(build_operation_reviews_export_text(), encoding="utf-8")
+    return path
+
+
+def slot_is_one_one_export(slot: Any) -> bool:
+    text = clean_text(slot)
+    if not text:
+        return False
+    return bool(re.search(r"1-1$", text, flags=re.IGNORECASE))
+
+
+def slot_flight_prefix_export(slot: Any) -> str | None:
+    text = clean_text(slot)
+    if not text:
+        return None
+
+    match = re.match(r"^(.*?)[\s_-]*1-\d+$", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+
+    prefix = clean_text(match.group(1))
+    return prefix.casefold() if prefix else None
+
+
+def stars_for_average(value: float | None) -> str:
+    if value is None:
+        return ""
+    filled = max(0, min(5, int(float(value) + 0.5)))
+    return "★" * filled + "☆" * (5 - filled)
+
+
+def stars_for_integer_rating(value: Any) -> str:
+    rating = int_or_none(value)
+    if rating is None:
+        return "Not rated"
+    rating = max(0, min(5, rating))
+    return f"{'★' * rating}{'☆' * (5 - rating)} {rating}/5"
+
+
+def flight_lead_review_rows() -> list[dict[str, Any]]:
+    with get_connection() as conn:
+        if not table_exists(conn, "attendance"):
+            return []
+
+        has_users = table_exists(conn, "users")
+        user_join = (
+            "LEFT JOIN users u ON u.discord_id = a.discord_id"
+            if has_users
+            else ""
+        )
+        user_columns = (
+            "u.display_name AS stored_display_name, "
+            "u.discord_username AS stored_discord_username"
+            if has_users
+            else "NULL AS stored_display_name, NULL AS stored_discord_username"
+        )
+
+        rows = conn.execute(
+            f"""
+            SELECT
+                a.entry_id,
+                a.scheduled_op_id,
+                a.discord_id,
+                a.user_name,
+                a.slot,
+                a.flight_lead_rating,
+                a.fl_remarks,
+                {user_columns}
+            FROM attendance a
+            {user_join}
+            WHERE a.status IN ('submitted', 'complete')
+              AND a.discord_id IS NOT NULL
+            ORDER BY a.scheduled_op_id ASC, a.entry_id ASC
+            """
+        ).fetchall()
+
+    leader_by_flight: dict[tuple[int, str], dict[str, Any]] = {}
+
+    for row in rows:
+        event_id = int_or_none(row["scheduled_op_id"])
+        prefix = slot_flight_prefix_export(row["slot"])
+
+        if event_id is None or prefix is None or not slot_is_one_one_export(row["slot"]):
+            continue
+
+        key = (event_id, prefix)
+        entry_id = int(row["entry_id"])
+        existing = leader_by_flight.get(key)
+
+        if existing is not None and entry_id >= int(existing["leader_entry_id"]):
+            continue
+
+        leader_name = (
+            clean_text(row["stored_display_name"])
+            or clean_text(row["stored_discord_username"])
+            or clean_text(row["user_name"])
+            or clean_text(row["discord_id"])
+            or "Unknown Flight Leader"
+        )
+
+        leader_by_flight[key] = {
+            "leader_entry_id": entry_id,
+            "leader_discord_id": clean_text(row["discord_id"]),
+            "leader_name": leader_name,
+        }
+
+    results: list[dict[str, Any]] = []
+
+    for row in rows:
+        rating = int_or_none(row["flight_lead_rating"])
+        remarks = clean_multiline_text(row["fl_remarks"])
+
+        if rating is None and not remarks:
+            continue
+
+        event_id = int_or_none(row["scheduled_op_id"])
+        prefix = slot_flight_prefix_export(row["slot"])
+
+        if event_id is None or prefix is None:
+            continue
+
+        leader = leader_by_flight.get((event_id, prefix))
+        if leader is None:
+            continue
+
+        reviewer_id = clean_text(row["discord_id"])
+        if reviewer_id and reviewer_id == leader["leader_discord_id"]:
+            continue
+
+        results.append(
+            {
+                "leader_discord_id": leader["leader_discord_id"],
+                "leader_name": leader["leader_name"],
+                "review_entry_id": int(row["entry_id"]),
+                "rating": rating,
+                "review": remarks,
+            }
+        )
+
+    results.sort(
+        key=lambda item: (
+            item["leader_name"].casefold(),
+            item["leader_discord_id"] or "",
+            item["review_entry_id"],
+        )
+    )
+    return results
+
+
+def build_flight_lead_reviews_export_text() -> str:
+    reviews = flight_lead_review_rows()
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+
+    for review in reviews:
+        key = (
+            review["leader_discord_id"] or "",
+            review["leader_name"],
+        )
+        grouped[key].append(review)
+
+    group_keys = sorted(
+        grouped,
+        key=lambda key: (key[1].casefold(), key[0]),
+    )
+
+    parts: list[str] = []
+
+    for key in group_keys:
+        leader_reviews = grouped[key]
+        ratings = [
+            int(review["rating"])
+            for review in leader_reviews
+            if review["rating"] is not None
+        ]
+        average = (sum(ratings) / len(ratings)) if ratings else None
+        review_count = len(leader_reviews)
+
+        if average is None:
+            rating_text = "☆☆☆☆☆ N/A"
+        else:
+            rating_text = f"{stars_for_average(average)} {average:.1f}"
+
+        parts.append(
+            f"{key[1]} {rating_text} ({review_count} Reviews)"
+        )
+        parts.append("-" * len(parts[-1]))
+
+        for review in leader_reviews:
+            # Keep rating-only entries in the average/count, but do not add a
+            # placeholder line when the reviewer left no written feedback.
+            if not review["review"]:
+                continue
+
+            review_text = indent_multiline(review["review"])
+            parts.append(f"ID {review['review_entry_id']}: {review_text}")
+
+        parts.append("")
+
+    if not parts:
+        return "No flight lead reviews were found.\n"
+
+    return "\n".join(parts).rstrip() + "\n"
+
+
+def create_flight_lead_reviews_export_file() -> Path:
+    path = export_directory() / f"flight_lead_reviews_{zulu_timestamp_for_filename()}.txt"
+    path.write_text(build_flight_lead_reviews_export_text(), encoding="utf-8")
+    return path
+
+
+def attendance_export_rows() -> list[dict[str, Any]]:
+    with get_connection() as conn:
+        if not table_exists(conn, "attendance"):
+            return []
+
+        has_events = table_exists(conn, "op_events")
+        has_users = table_exists(conn, "users")
+
+        event_join = (
+            "LEFT JOIN op_events oe ON oe.event_id = a.scheduled_op_id"
+            if has_events
+            else ""
+        )
+        user_join = (
+            "LEFT JOIN users u ON u.discord_id = a.discord_id"
+            if has_users
+            else ""
+        )
+        scheduled_time_sql = (
+            "COALESCE(oe.scheduled_at, a.logged_at, a.created_at)"
+            if has_events
+            else "COALESCE(a.logged_at, a.created_at)"
+        )
+        username_sql = (
+            "u.discord_username"
+            if has_users
+            else "NULL"
+        )
+
+        rows = conn.execute(
+            f"""
+            SELECT
+                a.entry_id,
+                a.scheduled_op_id,
+                COALESCE(
+                    NULLIF(TRIM(a.op_template_name), ''),
+                    'Unknown Operation'
+                ) AS op_template_name,
+                {scheduled_time_sql} AS scheduled_time,
+                a.discord_id,
+                {username_sql} AS stored_discord_username,
+                a.user_name,
+                a.slot,
+                a.aircraft,
+                a.landing_type,
+                a.combat_deaths,
+                a.wires,
+                a.bolters
+            FROM attendance a
+            {user_join}
+            {event_join}
+            WHERE a.status IN ('submitted', 'complete')
+            ORDER BY
+                COALESCE({scheduled_time_sql}, 0) DESC,
+                a.scheduled_op_id DESC,
+                a.entry_id ASC
+            """
+        ).fetchall()
+
+    result: list[dict[str, Any]] = []
+
+    for row in rows:
+        discord_id = clean_text(row["discord_id"])
+        stored_username = clean_text(row["stored_discord_username"])
+        attendance_username = clean_text(row["user_name"])
+
+        result.append(
+            {
+                "scheduled_op_id": int_or_none(row["scheduled_op_id"]),
+                "op_template_name": clean_text(row["op_template_name"]) or "Unknown Operation",
+                "scheduled_time": format_utc_timestamp(row["scheduled_time"]),
+                "discord_id": discord_id,
+                "discord_username": stored_username or attendance_username or discord_id,
+                "slot": clean_text(row["slot"]),
+                "aircraft": clean_text(row["aircraft"]),
+                "landing_type": clean_text(row["landing_type"]),
+                "combat_deaths": int_or_none(row["combat_deaths"]),
+                "wire": int_or_none(row["wires"]),
+                "bolters": int_or_none(row["bolters"]),
+            }
+        )
+
+    return result
+
+
+def build_attendance_export_xlsx_bytes() -> bytes:
+    rows = attendance_export_rows()
+    worksheet_rows = [
+        [
+            (row["scheduled_op_id"], STYLE_WRAP),
+            (row["op_template_name"], STYLE_WRAP),
+            (row["scheduled_time"], STYLE_WRAP),
+            (row["discord_id"], STYLE_WRAP),
+            (row["discord_username"], STYLE_WRAP),
+            (row["slot"], STYLE_WRAP),
+            (row["aircraft"], STYLE_WRAP),
+            (row["landing_type"], STYLE_WRAP),
+            (row["combat_deaths"], STYLE_WRAP),
+            (row["wire"], STYLE_WRAP),
+            (row["bolters"], STYLE_WRAP),
+        ]
+        for row in rows
+    ]
+
+    return build_generic_workbook_bytes(
+        [
+            {
+                "name": "Attendance",
+                "headers": [
+                    "scheduled_op_id",
+                    "op_template_name",
+                    "scheduled_time",
+                    "discord_id",
+                    "discord_username",
+                    "slot",
+                    "aircraft",
+                    "landing_type",
+                    "combat_deaths",
+                    "wire",
+                    "bolters",
+                ],
+                "rows": worksheet_rows,
+                "widths": [
+                    17,
+                    34,
+                    22,
+                    22,
+                    24,
+                    12,
+                    16,
+                    16,
+                    15,
+                    10,
+                    10,
+                ],
+                "auto_filter": True,
+            }
+        ]
+    )
+
+
+def create_attendance_export_file() -> Path:
+    path = export_directory() / f"attendance_{zulu_timestamp_for_filename()}.xlsx"
+    path.write_bytes(build_attendance_export_xlsx_bytes())
+    return path
+
+
+def create_database_backup_file() -> Path:
+    path = export_directory() / f"airboss_backup_{central_timestamp_for_filename()}.db"
+
+    with get_connection() as source:
+        with sqlite3.connect(path) as destination:
+            source.backup(destination)
+            check_row = destination.execute("PRAGMA quick_check").fetchone()
+            check_value = str(check_row[0] if check_row else "").strip().lower()
+
+            if check_value != "ok":
+                raise RuntimeError(
+                    f"SQLite quick_check failed for the backup: {check_value or 'unknown result'}"
+                )
+
+    return path
+
+
+def zip_export_file(path: Path) -> Path:
+    zip_path = path.with_suffix(path.suffix + ".zip")
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.write(path, arcname=path.name)
+
+    return zip_path

@@ -711,11 +711,39 @@ def username_for_discord_id(discord_id: str | None) -> str | None:
     )
 
 
+def validate_landing_submission(submission: AttendSubmission) -> None:
+    landing = clean_text(submission.landing_type)
+    allowed = {"Arrested", "FTR", "Airfield", "Vertical", "Non-Pilot", "DNF"}
+    if landing not in allowed:
+        raise ValueError("Invalid landing type.")
+
+    deaths = int(submission.combat_deaths)
+    if deaths < 0 or deaths > 24:
+        raise ValueError("Combat deaths must be between 0 and 24.")
+
+    if landing == "Arrested":
+        if submission.wires is None or not 0 <= int(submission.wires) <= 4:
+            raise ValueError("Arrested records require a wire value from 0 to 4.")
+        if submission.bolters is None or not 0 <= int(submission.bolters) <= 24:
+            raise ValueError("Arrested records require bolters from 0 to 24.")
+    elif landing == "FTR":
+        if submission.wires is not None:
+            raise ValueError("FTR records must use N/A for wire.")
+        if submission.bolters is None or not 0 <= int(submission.bolters) <= 24:
+            raise ValueError("FTR records require bolters from 0 to 24.")
+    elif submission.wires is not None or submission.bolters is not None:
+        raise ValueError(f"{landing} records cannot include wire or bolter values.")
+
+    if landing in {"Non-Pilot", "DNF"} and deaths != 0:
+        raise ValueError(f"{landing} records must use 0 combat deaths.")
+
+
 def submit_attendance(
     *,
     submission: AttendSubmission,
     flight_index: int | None,
 ) -> int:
+    validate_landing_submission(submission)
     ts = now_ts()
     resolved_user_name = username_for_discord_id(submission.discord_id)
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -50,6 +51,94 @@ class EWQuizAttemptRecord:
 
     def missed_answers(self) -> list[EWQuizAnswerRecord]:
         return [answer for answer in self.answers if answer.is_correct is False]
+
+
+@dataclass
+class ASVABAnswerRecord:
+    question_id: str
+    category: str | None
+    question_text: str
+    selected_letters: list[str]
+    selected_answers: list[str]
+    correct_letters: list[str]
+    correct_answers: list[str]
+    is_correct: bool | None
+    answered_at: int | None
+
+
+@dataclass
+class ASVABCategoryScoreRecord:
+    category: str
+    correct: int
+    total: int
+    percent: float
+
+
+@dataclass
+class ASVABAttemptRecord:
+    attempt_id: int
+    discord_id: str | None
+    discord_username: str | None
+    display_name: str | None
+    quiz_version: str
+    status: str
+    score_percent: float | None
+    correct_count: int
+    total_questions: int
+    started_at: int | None
+    expires_at: int | None
+    completed_at: int | None
+    updated_at: int | None
+    answers: list[ASVABAnswerRecord]
+    category_scores: list[ASVABCategoryScoreRecord]
+
+    @property
+    def id(self) -> int:
+        return self.attempt_id
+
+    @property
+    def created_at(self) -> int | None:
+        return self.started_at
+
+    def missed_answers(self) -> list[ASVABAnswerRecord]:
+        return [answer for answer in self.answers if answer.is_correct is False]
+
+
+@dataclass
+class FilingCabinetQualRequestRecord:
+    id: int
+    discord_id: str | None
+    discord_username: str | None
+
+    min_requirements: str | None
+    of_age: int | None
+    hours: float | None
+
+    preferred_aircraft: str | None
+    timezone: str | None
+    availability_start: str | None
+    availability_end: str | None
+    dotw: str | None
+
+    remarks: str | None
+    status: str
+    referral: str | None
+    times_pinged: int
+
+    created_at: int | None
+    updated_at: int | None
+
+    action_by_discord_id: str | None
+    action_remarks: str | None
+
+
+@dataclass
+class UserNoteRecord:
+    id: int
+    note_by: str
+    note_for: str
+    remarks: str
+    created_at: int
 
 
 @dataclass
@@ -241,6 +330,150 @@ def qual_attempt_from_row(row: Any) -> QualAttemptRecord:
     )
 
 
+_REQUEST_ACTION_RE = re.compile(
+    r"^(?:Denied by|Marked MIA by)\s+(\d+):\s*(.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def filing_cabinet_qual_request_from_row(row: Any) -> FilingCabinetQualRequestRecord:
+    stored_remarks = clean_text_or_none(row_value(row, "remarks"))
+    action_by_discord_id: str | None = None
+    action_remarks = stored_remarks
+
+    if stored_remarks:
+        match = _REQUEST_ACTION_RE.match(stored_remarks)
+
+        if match:
+            action_by_discord_id = clean_text_or_none(match.group(1))
+            action_remarks = clean_text_or_none(match.group(2))
+
+    return FilingCabinetQualRequestRecord(
+        id=int(row["id"]),
+        discord_id=clean_text_or_none(row_value(row, "discord_id")),
+        discord_username=clean_text_or_none(row_value(row, "discord_username")),
+        min_requirements=clean_text_or_none(row_value(row, "min_requirements")),
+        of_age=int_or_none(row_value(row, "of_age")),
+        hours=float_or_none(row_value(row, "hours")),
+        preferred_aircraft=clean_text_or_none(row_value(row, "preferred_aircraft")),
+        timezone=clean_text_or_none(row_value(row, "timezone")),
+        availability_start=clean_text_or_none(row_value(row, "availability_start")),
+        availability_end=clean_text_or_none(row_value(row, "availability_end")),
+        dotw=clean_text_or_none(row_value(row, "dotw")),
+        remarks=stored_remarks,
+        status=clean_text_or_none(row_value(row, "status")) or "unknown",
+        referral=clean_text_or_none(row_value(row, "referral")),
+        times_pinged=int_or_none(row_value(row, "times_pinged")) or 0,
+        created_at=int_or_none(row_value(row, "created_at")),
+        updated_at=int_or_none(row_value(row, "updated_at")),
+        action_by_discord_id=action_by_discord_id,
+        action_remarks=action_remarks,
+    )
+
+
+def ensure_user_notes_table() -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                note_by TEXT NOT NULL,
+                note_for TEXT NOT NULL,
+                remarks TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_user_notes_note_for_created_at
+            ON user_notes (note_for, created_at, id)
+            """
+        )
+
+
+def user_note_from_row(row: Any) -> UserNoteRecord:
+    return UserNoteRecord(
+        id=int(row["id"]),
+        note_by=clean_text_or_none(row_value(row, "note_by")) or "",
+        note_for=clean_text_or_none(row_value(row, "note_for")) or "",
+        remarks=clean_text_or_none(row_value(row, "remarks")) or "",
+        created_at=int_or_none(row_value(row, "created_at")) or 0,
+    )
+
+
+def get_user_notes_for_user(discord_id: str) -> list[UserNoteRecord]:
+    ensure_user_notes_table()
+
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, note_by, note_for, remarks, created_at
+            FROM user_notes
+            WHERE note_for = ?
+            ORDER BY created_at ASC, id ASC
+            """,
+            (str(discord_id),),
+        ).fetchall()
+
+    return [user_note_from_row(row) for row in rows]
+
+
+def add_user_note(
+    *,
+    note_by: str,
+    note_for: str,
+    remarks: str,
+) -> UserNoteRecord:
+    ensure_user_notes_table()
+
+    clean_remarks = clean_text_or_none(remarks)
+
+    if not clean_remarks:
+        raise ValueError("A note must contain remarks.")
+
+    created_at = int(time.time())
+
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO user_notes (note_by, note_for, remarks, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (str(note_by), str(note_for), clean_remarks, created_at),
+        )
+        note_id = int(cursor.lastrowid)
+
+    return UserNoteRecord(
+        id=note_id,
+        note_by=str(note_by),
+        note_for=str(note_for),
+        remarks=clean_remarks,
+        created_at=created_at,
+    )
+
+
+def get_mia_and_denied_qual_requests_for_user(
+    discord_id: str,
+) -> list[FilingCabinetQualRequestRecord]:
+    with get_connection() as conn:
+        if not table_exists(conn, "request_qual"):
+            return []
+
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM request_qual
+            WHERE discord_id = ?
+              AND LOWER(status) IN ('mia', 'denied')
+            ORDER BY COALESCE(updated_at, created_at) ASC, id ASC
+            """,
+            (str(discord_id),),
+        ).fetchall()
+
+    return [filing_cabinet_qual_request_from_row(row) for row in rows]
+
+
 def get_qualification_attempts_for_user(
     applicant_discord_id: str,
 ) -> list[QualAttemptRecord]:
@@ -395,6 +628,158 @@ def get_ew_quiz_attempts_for_user(
     return [ew_quiz_attempt_from_row(row) for row in rows]
 
 
+def clean_text_list(value: Any, fallback: Any = None) -> list[str]:
+    source = value if value is not None else fallback
+
+    if source is None:
+        return []
+
+    if isinstance(source, (list, tuple)):
+        values = source
+    else:
+        values = [source]
+
+    result: list[str] = []
+
+    for item in values:
+        text = clean_text_or_none(item)
+
+        if text is not None:
+            result.append(text)
+
+    return result
+
+
+def parse_asvab_answers(value: Any) -> list[ASVABAnswerRecord]:
+    if not value:
+        return []
+
+    try:
+        data = json.loads(str(value))
+    except Exception:
+        return []
+
+    if not isinstance(data, dict):
+        return []
+
+    answers: list[ASVABAnswerRecord] = []
+
+    for key, raw in data.items():
+        if not isinstance(raw, dict):
+            continue
+
+        question_id = clean_text_or_none(raw.get("question_id")) or str(key)
+
+        answers.append(
+            ASVABAnswerRecord(
+                question_id=question_id,
+                category=clean_text_or_none(raw.get("category")),
+                question_text=clean_text_or_none(raw.get("question_text")) or question_id,
+                selected_letters=clean_text_list(
+                    raw.get("selected_letters"),
+                    raw.get("selected_letter"),
+                ),
+                selected_answers=clean_text_list(
+                    raw.get("selected_answers"),
+                    raw.get("selected_answer"),
+                ),
+                correct_letters=clean_text_list(
+                    raw.get("correct_letters"),
+                    raw.get("correct_letter"),
+                ),
+                correct_answers=clean_text_list(
+                    raw.get("correct_answers"),
+                    raw.get("correct_answer"),
+                ),
+                is_correct=ew_bool_or_none(raw.get("is_correct")),
+                answered_at=int_or_none(raw.get("answered_at")),
+            )
+        )
+
+    answers.sort(key=lambda answer: (answer.answered_at or 0, answer.question_id))
+    return answers
+
+
+def parse_asvab_category_scores(value: Any) -> list[ASVABCategoryScoreRecord]:
+    if not value:
+        return []
+
+    try:
+        data = json.loads(str(value))
+    except Exception:
+        return []
+
+    if not isinstance(data, list):
+        return []
+
+    scores: list[ASVABCategoryScoreRecord] = []
+
+    for raw in data:
+        if not isinstance(raw, dict):
+            continue
+
+        category = clean_text_or_none(raw.get("category")) or "Uncategorized"
+        correct = int_or_none(raw.get("correct")) or 0
+        total = int_or_none(raw.get("total")) or 0
+        percent = float_or_none(raw.get("percent"))
+
+        if percent is None:
+            percent = (correct / total * 100.0) if total else 0.0
+
+        scores.append(
+            ASVABCategoryScoreRecord(
+                category=category,
+                correct=correct,
+                total=total,
+                percent=float(percent),
+            )
+        )
+
+    return scores
+
+
+def asvab_attempt_from_row(row: Any) -> ASVABAttemptRecord:
+    return ASVABAttemptRecord(
+        attempt_id=int(row["attempt_id"]),
+        discord_id=clean_text_or_none(row_value(row, "discord_id")),
+        discord_username=clean_text_or_none(row_value(row, "discord_username")),
+        display_name=clean_text_or_none(row_value(row, "display_name")),
+        quiz_version=clean_text_or_none(row_value(row, "quiz_version")) or "Unknown",
+        status=clean_text_or_none(row_value(row, "status")) or "Unknown",
+        score_percent=float_or_none(row_value(row, "score_percent")),
+        correct_count=int_or_none(row_value(row, "correct_count")) or 0,
+        total_questions=int_or_none(row_value(row, "total_questions")) or 0,
+        started_at=int_or_none(row_value(row, "started_at")),
+        expires_at=int_or_none(row_value(row, "expires_at")),
+        completed_at=int_or_none(row_value(row, "completed_at")),
+        updated_at=int_or_none(row_value(row, "updated_at")),
+        answers=parse_asvab_answers(row_value(row, "answers_json")),
+        category_scores=parse_asvab_category_scores(
+            row_value(row, "category_scores_json")
+        ),
+    )
+
+
+def get_asvab_attempts_for_user(
+    discord_id: str,
+) -> list[ASVABAttemptRecord]:
+    with get_connection() as conn:
+        if not table_exists(conn, "asvab_quiz_attempts"):
+            return []
+
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM asvab_quiz_attempts
+            WHERE discord_id = ?
+            ORDER BY started_at ASC, attempt_id ASC
+            """,
+            (str(discord_id),),
+        ).fetchall()
+
+    return [asvab_attempt_from_row(row) for row in rows]
+
+
 @dataclass
 class FlightLeadReviewRecord:
     # entry_id is the attendance row that left the review.
@@ -415,11 +800,43 @@ class FlightLeadReviewRecord:
     fl_remarks: str | None
 
 
+
+@dataclass
+class FilingCabinetAttendanceRecord:
+    entry_id: int
+    scheduled_op_id: int | None
+    op_name: str | None
+    scheduled_at: int | None
+    slot: str | None
+    aircraft: str | None
+    landing_type: str | None
+    wires: int | None
+    bolters: int | None
+    combat_deaths: int | None
+    attend_type: str | None
+    status: str | None
+    op_remarks: str | None
+    fl_remarks: str | None
+    note_remarks: str | None
+
+    @property
+    def id(self) -> int:
+        return self.entry_id
+
+    @property
+    def created_at(self) -> int | None:
+        return self.scheduled_at
+
+
 @dataclass
 class FilingCabinetUserStats:
     attends: int
     unique_ops: int
+    timezone: str | None
     flight_lead_reviews: list[FlightLeadReviewRecord]
+    ftr_count: int = 0
+    dnf_count: int = 0
+    promotion_cap: str | None = None
 
     @property
     def flight_lead_rating_count(self) -> int:
@@ -471,27 +888,136 @@ def slot_flight_prefix(slot: Any) -> str | None:
     return prefix.casefold() if prefix else None
 
 
+
+def attendance_records_for_user(discord_id: str) -> list[FilingCabinetAttendanceRecord]:
+    with get_connection() as conn:
+        if not table_exists(conn, "attendance"):
+            return []
+        rows = conn.execute(
+            """
+            SELECT a.entry_id, a.scheduled_op_id,
+                   COALESCE(ot.name, a.op_template_name) AS op_name,
+                   oe.scheduled_at, a.slot, a.aircraft, a.landing_type,
+                   a.wires, a.bolters, a.combat_deaths, a.attend_type, a.status,
+                   a.op_remarks, a.fl_remarks, a.note_remarks
+            FROM attendance a
+            LEFT JOIN op_events oe ON oe.event_id = a.scheduled_op_id
+            LEFT JOIN op_templates ot ON ot.id = oe.op_template_id
+            WHERE a.discord_id = ?
+              AND a.status IN ('submitted', 'complete')
+              AND a.landing_type IN ('FTR', 'DNF')
+            ORDER BY COALESCE(oe.scheduled_at, a.created_at, a.logged_at, 0), a.entry_id
+            """,
+            (str(discord_id),),
+        ).fetchall()
+    return [FilingCabinetAttendanceRecord(
+        entry_id=int(r["entry_id"]), scheduled_op_id=int_or_none(r["scheduled_op_id"]),
+        op_name=clean_text_or_none(r["op_name"]), scheduled_at=int_or_none(r["scheduled_at"]),
+        slot=clean_text_or_none(r["slot"]), aircraft=clean_text_or_none(r["aircraft"]),
+        landing_type=clean_text_or_none(r["landing_type"]), wires=int_or_none(r["wires"]),
+        bolters=int_or_none(r["bolters"]), combat_deaths=int_or_none(r["combat_deaths"]),
+        attend_type=clean_text_or_none(r["attend_type"]), status=clean_text_or_none(r["status"]),
+        op_remarks=clean_text_or_none(r["op_remarks"]), fl_remarks=clean_text_or_none(r["fl_remarks"]),
+        note_remarks=clean_text_or_none(r["note_remarks"]),
+    ) for r in rows]
+
+def landing_type_counts_for_user(discord_id: str) -> tuple[int, int]:
+    with get_connection() as conn:
+        if not table_exists(conn, "attendance"):
+            return 0, 0
+        row = conn.execute(
+            """SELECT
+                 SUM(CASE WHEN landing_type='FTR' THEN 1 ELSE 0 END) AS ftr_count,
+                 SUM(CASE WHEN landing_type='DNF' THEN 1 ELSE 0 END) AS dnf_count
+               FROM attendance
+               WHERE discord_id=? AND status IN ('submitted','complete')""",
+            (str(discord_id),),
+        ).fetchone()
+    return int(row["ftr_count"] or 0), int(row["dnf_count"] or 0)
+
+
 def attendance_counts_for_user(discord_id: str) -> tuple[int, int]:
     with get_connection() as conn:
         if not table_exists(conn, "attendance"):
             return 0, 0
 
-        row = conn.execute(
-            """
-            SELECT
-                COUNT(*) AS attends,
-                COUNT(DISTINCT scheduled_op_id) AS unique_ops
-            FROM attendance
-            WHERE discord_id = ?
-              AND status IN ('submitted', 'complete')
-            """,
-            (str(discord_id),),
-        ).fetchone()
+        if table_exists(conn, "op_events"):
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS attends,
+                    COUNT(DISTINCT COALESCE(
+                        CAST(oe.op_template_id AS TEXT),
+                        NULLIF(TRIM(a.op_template_name), '')
+                    )) AS unique_ops
+                FROM attendance a
+                LEFT JOIN op_events oe
+                    ON oe.event_id = a.scheduled_op_id
+                WHERE a.discord_id = ?
+                  AND a.status IN ('submitted', 'complete')
+                """,
+                (str(discord_id),),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS attends,
+                    COUNT(DISTINCT NULLIF(TRIM(op_template_name), '')) AS unique_ops
+                FROM attendance
+                WHERE discord_id = ?
+                  AND status IN ('submitted', 'complete')
+                """,
+                (str(discord_id),),
+            ).fetchone()
 
     if row is None:
         return 0, 0
 
     return int(row["attends"] or 0), int(row["unique_ops"] or 0)
+
+
+def promotion_cap_for_user(discord_id: str) -> str | None:
+    with get_connection() as conn:
+        if not table_exists(conn, "do_not_promote"):
+            return None
+
+        row = conn.execute(
+            """
+            SELECT max_rank
+            FROM do_not_promote
+            WHERE discord_id = ?
+              AND max_rank IS NOT NULL
+              AND TRIM(max_rank) != ''
+            LIMIT 1
+            """,
+            (str(discord_id),),
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    return clean_text_or_none(row["max_rank"])
+
+
+def timezone_for_user(discord_id: str) -> str | None:
+    with get_connection() as conn:
+        if not table_exists(conn, "user_settings"):
+            return None
+
+        row = conn.execute(
+            """
+            SELECT timezone
+            FROM user_settings
+            WHERE discord_id = ?
+            """,
+            (str(discord_id),),
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    return clean_text_or_none(row["timezone"])
 
 
 def flight_lead_review_from_row(row: Any) -> FlightLeadReviewRecord:
@@ -641,6 +1167,9 @@ def get_filing_cabinet_user_stats(
     include_flight_lead_reviews: bool = False,
 ) -> FilingCabinetUserStats:
     attends, unique_ops = attendance_counts_for_user(discord_id)
+    timezone = timezone_for_user(discord_id)
+    ftr_count, dnf_count = landing_type_counts_for_user(discord_id)
+    promotion_cap = promotion_cap_for_user(discord_id)
     reviews = (
         flight_lead_reviews_for_user(discord_id)
         if include_flight_lead_reviews
@@ -650,6 +1179,10 @@ def get_filing_cabinet_user_stats(
     return FilingCabinetUserStats(
         attends=attends,
         unique_ops=unique_ops,
+        timezone=timezone,
         flight_lead_reviews=reviews,
+        ftr_count=ftr_count,
+        dnf_count=dnf_count,
+        promotion_cap=promotion_cap,
     )
 

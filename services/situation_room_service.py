@@ -3,15 +3,19 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import shutil
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import discord
 
 from database import get_connection
 from services.display_name_service import prune_display_name
+from services.wire_gpa_service import bolter_score, wire_score_map
 
 
 try:
@@ -27,7 +31,7 @@ except ImportError:
 try:
     from config import SITUATION_ROOM_STATE_FILE
 except ImportError:
-    SITUATION_ROOM_STATE_FILE = "situation_room_messages.json"
+    SITUATION_ROOM_STATE_FILE = "data/situation_room_messages.json"
 
 try:
     from config import SITUATION_ROOM_UPDATE_DELAY_SECONDS
@@ -38,6 +42,11 @@ try:
     from config import SITUATION_ROOM_REORDER_DELAY_SECONDS
 except ImportError:
     SITUATION_ROOM_REORDER_DELAY_SECONDS = 1.0
+
+try:
+    from config import SCHEDULE_DEFAULT_TIMEZONE
+except ImportError:
+    SCHEDULE_DEFAULT_TIMEZONE = "America/Chicago"
 
 
 ANSI_RESET = "\u001b[0m"
@@ -82,13 +91,119 @@ def clean_text(value: Any) -> str | None:
     return text or None
 
 
+def _bot_root() -> Path:
+    # services/situation_room_service.py -> Bookkeeperv1.3/
+    return Path(__file__).resolve().parents[1]
+
+
 def state_file_path() -> Path:
     configured = Path(str(SITUATION_ROOM_STATE_FILE))
 
     if configured.is_absolute():
         return configured
 
-    return Path.cwd() / configured
+    return _bot_root() / configured
+
+
+def _legacy_state_file_candidates() -> list[Path]:
+    """
+    Old versions resolved relative state files through Path.cwd(), which could
+    create situation_room_messages.json in different root folders depending on
+    how the bot was launched.
+
+    Check the common old locations and move the active one into data/ on first run.
+    """
+    filename = "situation_room_messages.json"
+    candidates = [
+        Path.cwd() / filename,
+        _bot_root() / filename,
+        _bot_root().parent / filename,
+    ]
+
+    unique: list[Path] = []
+    seen: set[Path] = set()
+
+    for candidate in candidates:
+        try:
+            key = candidate.resolve()
+        except Exception:
+            key = candidate
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        unique.append(candidate)
+
+    return unique
+
+
+def migrate_state_file_if_needed() -> None:
+    """Move legacy root state into the configured data path exactly once.
+
+    Some older configurations explicitly pointed at ``situation_room_messages.json`` in the
+    Bookkeeper root. If both files exist, keep the newer one so switching the
+    configuration to ``data/`` does not restore stale Discord message IDs.
+    """
+    target = state_file_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    root_legacy = _bot_root() / "situation_room_messages.json"
+
+    try:
+        same_path = root_legacy.resolve() == target.resolve()
+    except Exception:
+        same_path = root_legacy == target
+
+    if not same_path and root_legacy.exists():
+        try:
+            use_legacy = (
+                not target.exists()
+                or root_legacy.stat().st_mtime_ns >= target.stat().st_mtime_ns
+            )
+
+            if use_legacy:
+                temporary = target.with_name(target.name + ".migrating")
+                shutil.copy2(root_legacy, temporary)
+                temporary.replace(target)
+                print(f"✅ Migrated newer situation room state JSON to: {target}")
+
+            # The data-folder file is now authoritative. Removing the root copy
+            # prevents future confusion and confirms the migration completed.
+            if target.exists():
+                root_legacy.unlink()
+                print(f"✅ Removed legacy situation room state JSON: {root_legacy}")
+        except Exception as error:
+            print(
+                f"⚠️ Could not migrate situation room state JSON "
+                f"from {root_legacy} to {target}: {error}"
+            )
+
+    if target.exists():
+        return
+
+    # Retain compatibility with still older launches that resolved the path
+    # relative to the process working directory or the bots parent directory.
+    for legacy_path in _legacy_state_file_candidates():
+        try:
+            if legacy_path.resolve() == target.resolve():
+                continue
+        except Exception:
+            pass
+
+        if not legacy_path.exists():
+            continue
+
+        try:
+            shutil.move(str(legacy_path), str(target))
+            print(f"✅ Moved situation room state JSON to data folder: {target}")
+            return
+        except Exception as error:
+            print(
+                f"⚠️ Could not move situation room state JSON "
+                f"from {legacy_path} to {target}: {error}"
+            )
+
 
 
 def default_state() -> dict[str, Any]:
@@ -101,6 +216,7 @@ def default_state() -> dict[str, Any]:
 
 
 def load_state() -> dict[str, Any]:
+    migrate_state_file_if_needed()
     path = state_file_path()
 
     if not path.exists():
@@ -140,6 +256,7 @@ def load_state() -> dict[str, Any]:
 
 
 def save_state(state: dict[str, Any]) -> None:
+    migrate_state_file_if_needed()
     path = state_file_path()
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -203,9 +320,26 @@ def configured_reorder_delay() -> float:
         return 1.0
 
 
+def situation_room_timezone() -> ZoneInfo:
+    try:
+        return ZoneInfo(str(SCHEDULE_DEFAULT_TIMEZONE or "America/Chicago"))
+    except Exception:
+        return ZoneInfo("America/Chicago")
+
+
+def start_of_situation_room_day_ts() -> int:
+    tz = situation_room_timezone()
+    now_local = datetime.now(tz)
+    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(start_local.timestamp())
+
+
 def fetch_situation_events() -> list[SituationRoomEvent]:
-    current = now_ts()
-    horizon = current + (7 * 24 * 60 * 60)
+    # Completed attendance boards remain visible for the rest of the local
+    # Situation Room day. op_events.updated_at is set when an op is completed,
+    # so a late-running op that finishes after midnight remains visible through
+    # the end of the day on which it actually completed.
+    today_start = start_of_situation_room_day_ts()
 
     with get_connection() as conn:
         rows = conn.execute(
@@ -219,16 +353,14 @@ def fetch_situation_events() -> list[SituationRoomEvent]:
             FROM op_events oe
             JOIN op_templates ot
                 ON ot.id = oe.op_template_id
-            WHERE (
-                    oe.status = 'Scheduled'
-                AND oe.scheduled_at >= ?
-                AND oe.scheduled_at <= ?
-            )
-               OR oe.status = 'Briefing'
-               OR oe.status = 'Open'
+            WHERE oe.status IN ('Scheduled', 'Briefing', 'Open')
+               OR (
+                    oe.status = 'Complete'
+                    AND COALESCE(oe.updated_at, oe.scheduled_at) >= ?
+               )
             ORDER BY oe.scheduled_at ASC, oe.event_id ASC
             """,
-            (current, horizon),
+            (today_start,),
         ).fetchall()
 
     return [
@@ -255,7 +387,7 @@ def desired_boards() -> list[SituationBoard]:
                     event=event,
                 )
             )
-        elif event.status == "Open":
+        elif event.status in {"Open", "Complete"}:
             boards.append(
                 SituationBoard(
                     key=f"attendance:{event.event_id}",
@@ -443,6 +575,7 @@ def attendance_flights_and_rows(event_id: int) -> tuple[list[dict[str, Any]], li
                 a.combat_deaths,
                 a.landing_type,
                 a.wires,
+                a.bolters,
                 a.status,
                 u.display_name,
                 u.discord_username
@@ -450,7 +583,7 @@ def attendance_flights_and_rows(event_id: int) -> tuple[list[dict[str, Any]], li
             LEFT JOIN users u
                 ON u.discord_id = a.discord_id
             WHERE a.scheduled_op_id = ?
-              AND a.status = 'submitted'
+              AND a.status IN ('submitted', 'complete')
               AND a.discord_id IS NOT NULL
             ORDER BY a.updated_at ASC, a.entry_id ASC
             """,
@@ -458,6 +591,60 @@ def attendance_flights_and_rows(event_id: int) -> tuple[list[dict[str, Any]], li
         ).fetchall()
 
     return [dict(row) for row in flights], [dict(row) for row in attendance_rows]
+
+
+def operation_gpa(event_id: int) -> float | None:
+    """Return the operation's wire GPA using the same attempt math as Greenie.
+
+    Each bolter is one GPA attempt worth the configured bolter score, and a
+    caught 1-4 wire is one additional attempt worth its configured wire score.
+    """
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                a.wires,
+                a.bolters
+            FROM attendance a
+            WHERE a.scheduled_op_id = ?
+              AND a.status IN ('submitted', 'complete')
+              AND a.landing_type IN ('Arrested', 'FTR')
+              AND (
+                    a.wires BETWEEN 1 AND 4
+                 OR COALESCE(a.bolters, 0) > 0
+              )
+            ORDER BY a.entry_id ASC
+            """,
+            (int(event_id),),
+        ).fetchall()
+
+    scores = wire_score_map()
+    total_score = 0.0
+    attempts = 0
+
+    for row in rows:
+        try:
+            bolters = max(0, int(row["bolters"] or 0))
+        except (TypeError, ValueError):
+            bolters = 0
+
+        if bolters:
+            total_score += bolters * bolter_score()
+            attempts += bolters
+
+        try:
+            wire = int(row["wires"]) if row["wires"] is not None else None
+        except (TypeError, ValueError):
+            wire = None
+
+        if wire in scores:
+            total_score += scores[wire]
+            attempts += 1
+
+    if attempts <= 0:
+        return None
+
+    return total_score / attempts
 
 
 def normalized_slot(value: str | None) -> str:
@@ -498,21 +685,20 @@ def attendance_detail_line(label: str, row: dict[str, Any]) -> str:
         or "Unknown"
     )
     name = prune_display_name(raw_name, fallback=row.get("discord_id") or "Unknown")
-    deaths = row.get("combat_deaths")
     landing = clean_text(row.get("landing_type")) or "Unknown"
 
-    parts = [
-        label,
-        name,
-        f"{int(deaths) if deaths is not None else 0} Deaths",
-        landing,
-    ]
+    deaths = row.get("combat_deaths")
+    wires = row.get("wires")
+    bolters = row.get("bolters")
 
-    if landing == "Arrested" and row.get("wires") is not None:
-        wire_count = int(row["wires"])
-        parts.append(f"{wire_count} Wire" + ("" if wire_count == 1 else "s"))
+    death_value = str(int(deaths)) if deaths is not None else "N/A"
+    wire_value = str(int(wires)) if wires is not None else "N/A"
+    bolter_value = str(int(bolters)) if bolters is not None else "N/A"
 
-    return " - ".join(parts)
+    return (
+        f"{label} - {name} - {landing} "
+        f"D:{death_value} W:{wire_value} B:{bolter_value}"
+    )
 
 
 def render_reservation_embed(board: SituationBoard) -> discord.Embed:
@@ -634,9 +820,14 @@ def render_attendance_embed(board: SituationBoard) -> discord.Embed:
     if not lines:
         lines.append(f"{ANSI_RED}No attendance slots found.{ANSI_RESET}")
 
+    gpa = operation_gpa(board.event.event_id)
+    gpa_text = f"{gpa:.2f}" if gpa is not None else "—"
+
     description_lines = [
         f"<t:{board.event.scheduled_at}:F>",
         f"<t:{board.event.scheduled_at}:R>",
+        f"State: **{board.event.status}**",
+        f"Operation GPA: **{gpa_text}**",
         f"```ansi\n{chr(10).join(lines)[:3600]}\n```",
     ]
 

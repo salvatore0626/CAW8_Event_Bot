@@ -320,16 +320,22 @@ def normal_completed_events() -> list[dict[str, Any]]:
 
 
 def _auto_ace_candidates() -> list[AwardCandidate]:
+    """Award one Ace per completed Normal op for a perfect 3-wire trap.
+
+    Only Arrested attendance participates. A qualifying player must have zero
+    combat deaths, zero bolters, and exactly a 3-wire. If duplicate qualifying
+    attendance rows exist for the same player/event, only one Ace is produced.
+    """
     with get_connection() as conn:
         rows = conn.execute(
             """
             SELECT
-                a.entry_id,
+                MIN(a.entry_id) AS entry_id,
                 a.discord_id,
-                a.slot,
-                a.aircraft,
                 oe.event_id,
-                oe.scheduled_at
+                oe.scheduled_at,
+                MIN(NULLIF(TRIM(a.slot), '')) AS slot,
+                MIN(NULLIF(TRIM(a.aircraft), '')) AS aircraft
             FROM attendance a
             JOIN op_events oe
                 ON oe.event_id = a.scheduled_op_id
@@ -343,20 +349,23 @@ def _auto_ace_candidates() -> list[AwardCandidate]:
               AND a.wires = 3
               AND a.bolters = 0
               AND a.combat_deaths = 0
-            ORDER BY oe.scheduled_at ASC, oe.event_id ASC, a.entry_id ASC
+            GROUP BY a.discord_id, oe.event_id, oe.scheduled_at
+            ORDER BY oe.scheduled_at ASC, oe.event_id ASC, a.discord_id ASC
             """
         ).fetchall()
 
     candidates: list[AwardCandidate] = []
 
     for row in rows:
+        discord_id = str(row["discord_id"])
+        event_id = int(row["event_id"])
         entry_id = int(row["entry_id"])
         candidates.append(
             AwardCandidate(
                 award_type="ACE",
-                award_key=f"ace:attendance:{entry_id}",
-                discord_id=str(row["discord_id"]),
-                source_event_id=int(row["event_id"]),
+                award_key=f"ace:player:{discord_id}:event:{event_id}",
+                discord_id=discord_id,
+                source_event_id=event_id,
                 source_attendance_entry_id=entry_id,
                 earned_at=int(row["scheduled_at"]),
                 details={
@@ -373,24 +382,22 @@ def _auto_ace_candidates() -> list[AwardCandidate]:
 
 
 def _auto_golden_wrench_candidates() -> list[AwardCandidate]:
-    """Award at 5, 10, 15... attended Normal completed ops without a death.
+    """Award at 5, 10, 15... qualifying operations without a death.
 
-    The streak continues after each award. Only a later attended Normal op with
-    one or more combat deaths resets it.
+    Only Arrested, Vertical, and Airfield attendance from completed Normal ops
+    participates. Other landing types are ignored and neither advance nor reset
+    the streak. Any qualifying attendance with one or more deaths resets it.
     """
     with get_connection() as conn:
         rows = conn.execute(
             """
             SELECT
+                MIN(a.entry_id) AS entry_id,
                 a.discord_id,
                 oe.event_id,
                 oe.scheduled_at,
-                MAX(
-                    CASE
-                        WHEN COALESCE(a.combat_deaths, 0) > 0 THEN 1
-                        ELSE 0
-                    END
-                ) AS has_death
+                MAX(CASE WHEN COALESCE(a.combat_deaths, 0) > 0 THEN 1 ELSE 0 END) AS has_death,
+                MAX(CASE WHEN a.landing_type = 'FTR' THEN 1 ELSE 0 END) AS has_ftr
             FROM attendance a
             JOIN op_events oe
                 ON oe.event_id = a.scheduled_op_id
@@ -400,6 +407,7 @@ def _auto_golden_wrench_candidates() -> list[AwardCandidate]:
               AND ot.type = 'Normal'
               AND a.status IN ('submitted', 'complete')
               AND a.discord_id IS NOT NULL
+              AND a.landing_type IN ('Arrested', 'Vertical', 'Airfield', 'FTR')
             GROUP BY a.discord_id, oe.event_id, oe.scheduled_at
             ORDER BY a.discord_id ASC, oe.scheduled_at ASC, oe.event_id ASC
             """
@@ -416,9 +424,7 @@ def _auto_golden_wrench_candidates() -> list[AwardCandidate]:
             current_user = discord_id
             streak = 0
 
-        has_death = int(row["has_death"] or 0) > 0
-
-        if has_death:
+        if int(row["has_death"] or 0) > 0 or int(row["has_ftr"] or 0) > 0:
             streak = 0
             continue
 
@@ -437,11 +443,16 @@ def _auto_golden_wrench_candidates() -> list[AwardCandidate]:
                 ),
                 discord_id=discord_id,
                 source_event_id=event_id,
-                source_attendance_entry_id=None,
+                source_attendance_entry_id=int(row["entry_id"]),
                 earned_at=int(row["scheduled_at"]),
                 details={
-                    "death_free_operation_streak": streak,
+                    "death_free_qualifying_operation_streak": streak,
                     "milestone": streak,
+                    "qualifying_landing_types": [
+                        "Arrested",
+                        "Vertical",
+                        "Airfield",
+                    ],
                 },
             )
         )
@@ -450,23 +461,24 @@ def _auto_golden_wrench_candidates() -> list[AwardCandidate]:
 
 
 def _auto_safety_s_candidates() -> list[AwardCandidate]:
-    """Award at 5, 10, 15... clean arrested recoveries in Normal completed ops.
+    """Award at 5, 10, 15... clean Arrested recoveries.
 
-    Only Arrested attendance records participate. Every other landing type is
-    ignored completely. Any Arrested landing with one or more bolters resets the
-    arrested-landing streak.
+    Only Arrested attendance from completed Normal ops participates. Other
+    landing types are ignored and neither advance nor reset the streak. Any
+    Arrested landing with one or more bolters resets it.
     """
     with get_connection() as conn:
         rows = conn.execute(
             """
             SELECT
-                a.entry_id,
+                MIN(a.entry_id) AS entry_id,
                 a.discord_id,
-                a.slot,
-                a.aircraft,
-                a.bolters,
                 oe.event_id,
-                oe.scheduled_at
+                oe.scheduled_at,
+                MIN(NULLIF(TRIM(a.slot), '')) AS slot,
+                MIN(NULLIF(TRIM(a.aircraft), '')) AS aircraft,
+                MAX(COALESCE(a.bolters, 0)) AS bolters,
+                MAX(CASE WHEN a.landing_type = 'FTR' THEN 1 ELSE 0 END) AS has_ftr
             FROM attendance a
             JOIN op_events oe
                 ON oe.event_id = a.scheduled_op_id
@@ -476,9 +488,9 @@ def _auto_safety_s_candidates() -> list[AwardCandidate]:
               AND ot.type = 'Normal'
               AND a.status IN ('submitted', 'complete')
               AND a.discord_id IS NOT NULL
-              AND a.landing_type = 'Arrested'
-              AND a.bolters IS NOT NULL
-            ORDER BY a.discord_id ASC, oe.scheduled_at ASC, oe.event_id ASC, a.entry_id ASC
+              AND a.landing_type IN ('Arrested', 'Vertical', 'Airfield', 'FTR')
+            GROUP BY a.discord_id, oe.event_id, oe.scheduled_at
+            ORDER BY a.discord_id ASC, oe.scheduled_at ASC, oe.event_id ASC
             """
         ).fetchall()
 
@@ -493,9 +505,7 @@ def _auto_safety_s_candidates() -> list[AwardCandidate]:
             current_user = discord_id
             streak = 0
 
-        bolters = int(row["bolters"] or 0)
-
-        if bolters > 0:
+        if int(row["bolters"] or 0) > 0 or int(row["has_ftr"] or 0) > 0:
             streak = 0
             continue
 
@@ -505,19 +515,20 @@ def _auto_safety_s_candidates() -> list[AwardCandidate]:
             continue
 
         entry_id = int(row["entry_id"])
+        event_id = int(row["event_id"])
         candidates.append(
             AwardCandidate(
                 award_type="SAFETY_S",
                 award_key=(
                     f"safety_s:player:{discord_id}:"
-                    f"attendance:{entry_id}:milestone:{streak}"
+                    f"event:{event_id}:milestone:{streak}"
                 ),
                 discord_id=discord_id,
-                source_event_id=int(row["event_id"]),
+                source_event_id=event_id,
                 source_attendance_entry_id=entry_id,
                 earned_at=int(row["scheduled_at"]),
                 details={
-                    "clean_arrested_landing_streak": streak,
+                    "clean_recovery_streak": streak,
                     "milestone": streak,
                     "slot": clean_text(row["slot"]),
                     "aircraft": clean_text(row["aircraft"]),
@@ -527,7 +538,6 @@ def _auto_safety_s_candidates() -> list[AwardCandidate]:
         )
 
     return candidates
-
 
 def calculate_auto_award_candidates() -> list[AwardCandidate]:
     ensure_reward_schema()

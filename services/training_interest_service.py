@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import discord
 
 from config import TRAINING_TOPICS
+from services.user_settings_service import safe_zoneinfo
 from database import get_connection, ensure_user_settings_schema
 from services.user_settings_service import ensure_user_and_settings
 
@@ -354,7 +355,7 @@ def is_within_notification_window(
         return False
 
     try:
-        local_now = datetime.now(ZoneInfo(str(timezone)))
+        local_now = datetime.now(safe_zoneinfo(timezone))
     except ZoneInfoNotFoundError:
         return False
     except Exception:
